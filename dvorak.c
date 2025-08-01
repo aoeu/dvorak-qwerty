@@ -196,8 +196,6 @@ static void usage(const char *path) {
     fprintf(stderr, "  -m STRING\t\t"
                     "Match only the STRING with the USB device name. \n"
                     "\t\t\tSTRING can contain multiple words, separated by space.\n");
-    fprintf(stderr, "  -t\t\t\t"
-                    "Disable layout toggle feature (press Left-Alt 3 times to switch layout).\n");
     fprintf(stderr, "example: %s -u -d /dev/input/by-id/usb-Logitech_USB_Receiver-if02-event-kbd -m \"k750 k350\"\n", basename);
 }
 
@@ -207,7 +205,6 @@ int main(int argc, char *argv[]) {
     int opt;
     char *device = NULL,
          *match = NULL;
-    bool noToggle = false;
     while ((opt = getopt(argc, argv, "d:m:tc")) != -1) {
         switch (opt) {
             case 'd':
@@ -215,9 +212,6 @@ int main(int argc, char *argv[]) {
                 break;
             case 'm':
                 match = optarg;
-                break;
-            case 't':
-                noToggle = true;
                 break;
             default:
                 usage(argv[0]);
@@ -406,10 +400,9 @@ int main(int argc, char *argv[]) {
     }
 
     struct input_event ev = {0};
-    int l_alt =0,
-        mod_state = 0,
+    int mod_state = 0,
         array_qwerty_counter = 0;
-    bool disable_mapping = false;
+
     unsigned int array_qwerty[MAX_LENGTH] = {0};
 
     fprintf(stderr, "Staring event loop with keyboard: [%s] for device [%s].\n", keyboard_name, device);
@@ -424,17 +417,7 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        if (!noToggle && ev.code == KEY_LEFTALT) {
-            if (ev.value == 1 && ++l_alt >= 3) {
-                disable_mapping = !disable_mapping;
-                l_alt = 0;
-                fprintf(stdout, "mapping is set to [%s]\n", !disable_mapping ? "true" : "false");
-            }
-        } else if (ev.type == EV_KEY) {
-            l_alt = 0;
-        }
-
-        if(!disable_mapping && ev.type == EV_KEY) {
+        if(ev.type == EV_KEY) {
             int mod_current = modifier_bit(ev.code);
 
             if (mod_current > 0) {
