@@ -29,8 +29,6 @@ static int modifier_bit(int key) {
             return 4;
         case KEY_LEFTMETA:
             return 8;
-        case KEY_CAPSLOCK:
-            return 16;
         default:
             return 0;
     }
@@ -200,8 +198,6 @@ static void usage(const char *path) {
                     "\t\t\tSTRING can contain multiple words, separated by space.\n");
     fprintf(stderr, "  -t\t\t\t"
                     "Disable layout toggle feature (press Left-Alt 3 times to switch layout).\n");
-    fprintf(stderr, "  -c\t\t\t"
-                    "Disable caps lock as a modifier.\n\n");
     fprintf(stderr, "example: %s -u -d /dev/input/by-id/usb-Logitech_USB_Receiver-if02-event-kbd -m \"k750 k350\"\n", basename);
 }
 
@@ -211,8 +207,7 @@ int main(int argc, char *argv[]) {
     int opt;
     char *device = NULL,
          *match = NULL;
-    bool noToggle = false,
-         noCapsLockAsModifier = false;
+    bool noToggle = false;
     while ((opt = getopt(argc, argv, "d:m:tc")) != -1) {
         switch (opt) {
             case 'd':
@@ -223,9 +218,6 @@ int main(int argc, char *argv[]) {
                 break;
             case 't':
                 noToggle = true;
-                break;
-            case 'c':
-                noCapsLockAsModifier = true;
                 break;
             default:
                 usage(argv[0]);
@@ -444,10 +436,6 @@ int main(int argc, char *argv[]) {
 
         if(!disable_mapping && ev.type == EV_KEY) {
             int mod_current = modifier_bit(ev.code);
-
-            if(noCapsLockAsModifier && mod_current == modifier_bit(KEY_CAPSLOCK)) {
-                mod_current = 0;
-            }
 
             if (mod_current > 0) {
                 if (ev.value != 0) {
