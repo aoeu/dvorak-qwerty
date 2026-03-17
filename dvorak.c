@@ -12,10 +12,16 @@
 #define MAX_LENGTH 8
 
 static int fdi;
+static int fdo;
 static volatile sig_atomic_t keep_running = 1;
-static void sig_handler(int sig) {
+static void sig_handler(int _sig) {
+    (void)_sig;
     keep_running = 0;
+    // Releasing the grab before closing lets the kernel hand the device back
+    // to normal immediately rather than waiting for cleanup.
+    ioctl(fdi, EVIOCGRAB, 0);
     close(fdi);
+    close(fdo);
 }
 
 //from: https://github.com/kentonv/dvorak-qwerty/tree/master/unix
@@ -35,83 +41,50 @@ static int modifier_bit(int key) {
 }
 
 //from: https://github.com/kentonv/dvorak-qwerty/tree/master/unix
-static int qwerty2dvorak(int key) {
+// Maps a physical QWERTY scancode to the QWERTY scancode that produces
+// the same character under a Dvorak layout.  This is the inverse of
+// qwerty2dvorak and is used when the OS is in QWERTY mode so that
+// typing produces Dvorak characters.
+static int dvorak_to_qwerty(int key) {
     switch (key) {
-        case KEY_MINUS:
-            return KEY_APOSTROPHE;
-        case KEY_EQUAL:
-            return KEY_RIGHTBRACE;
-        case KEY_Q:
-            return KEY_X;
-        case KEY_W:
-            return KEY_COMMA;
-        case KEY_E:
-            return KEY_D;
-        case KEY_R:
-            return KEY_O;
-        case KEY_T:
-            return KEY_K;
-        case KEY_Y:
-            return KEY_T;
-        case KEY_U:
-            return KEY_F;
-        case KEY_I:
-            return KEY_G;
-        case KEY_O:
-            return KEY_S;
-        case KEY_P:
-            return KEY_R;
-        case KEY_LEFTBRACE:
-            return KEY_MINUS;
-        case KEY_RIGHTBRACE:
-            return KEY_EQUAL;
-        case KEY_A:
-            return KEY_A;
-        case KEY_S:
-            return KEY_SEMICOLON;
-        case KEY_D:
-            return KEY_H;
-        case KEY_F:
-            return KEY_Y;
-        case KEY_G:
-            return KEY_U;
-        case KEY_H:
-            return KEY_J;
-        case KEY_J:
-            return KEY_C;
-        case KEY_K:
-            return KEY_V;
-        case KEY_L:
-            return KEY_P;
-        case KEY_SEMICOLON:
-            return KEY_Z;
-        case KEY_APOSTROPHE:
-            return KEY_Q;
-        case KEY_Z:
-            return KEY_SLASH;
-        case KEY_X:
-            return KEY_B;
-        case KEY_C:
-            return KEY_I;
-        case KEY_V:
-            return KEY_DOT;
-        case KEY_B:
-            return KEY_N;
-        case KEY_N:
-            return KEY_L;
-        case KEY_M:
-            return KEY_M;
-        case KEY_COMMA:
-            return KEY_W;
-        case KEY_DOT:
-            return KEY_E;
-        case KEY_SLASH:
-            return KEY_LEFTBRACE;
-        default:
-            return key;
+        case KEY_MINUS:      return KEY_LEFTBRACE;
+        case KEY_EQUAL:      return KEY_RIGHTBRACE;
+        case KEY_Q:          return KEY_APOSTROPHE;
+        case KEY_W:          return KEY_COMMA;
+        case KEY_E:          return KEY_DOT;
+        case KEY_R:          return KEY_P;
+        case KEY_T:          return KEY_Y;
+        case KEY_Y:          return KEY_F;
+        case KEY_U:          return KEY_G;
+        case KEY_I:          return KEY_C;
+        case KEY_O:          return KEY_R;
+        case KEY_P:          return KEY_L;
+        case KEY_LEFTBRACE:  return KEY_SLASH;
+        case KEY_RIGHTBRACE: return KEY_EQUAL;
+        case KEY_A:          return KEY_A;
+        case KEY_S:          return KEY_O;
+        case KEY_D:          return KEY_E;
+        case KEY_F:          return KEY_U;
+        case KEY_G:          return KEY_I;
+        case KEY_H:          return KEY_D;
+        case KEY_J:          return KEY_H;
+        case KEY_K:          return KEY_T;
+        case KEY_L:          return KEY_N;
+        case KEY_SEMICOLON:  return KEY_S;
+        case KEY_APOSTROPHE: return KEY_MINUS;
+        case KEY_Z:          return KEY_SEMICOLON;
+        case KEY_X:          return KEY_Q;
+        case KEY_C:          return KEY_J;
+        case KEY_V:          return KEY_K;
+        case KEY_B:          return KEY_X;
+        case KEY_N:          return KEY_B;
+        case KEY_M:          return KEY_M;
+        case KEY_COMMA:      return KEY_W;
+        case KEY_DOT:        return KEY_V;
+        case KEY_SLASH:      return KEY_Z;
+        default:             return key;
     }
 }
-
 static ssize_t emit(int fd, int type, int code, int value, struct timeval time) {
     struct input_event ev = {0};
     ev.type = type;
@@ -183,6 +156,52 @@ static bool setup_event_type(int fdo, unsigned long event_type, int max_val, con
         }
     }
     return true;
+}
+
+// Returns true if dvorak_code is in the remapped-keys tracking array.
+static bool remapped_find(const unsigned int *keys, int count, int dvorak_code) {
+    for (int i = 0; i < count; i++)
+        if ((int)keys[i] == dvorak_code) return true;
+    return false;
+}
+
+// Removes dvorak_code from the tracking array. Returns true if it was present.
+static bool remapped_remove(unsigned int *keys, int *count, int dvorak_code) {
+    for (int i = 0; i < *count; i++) {
+        if ((int)keys[i] != dvorak_code) continue;
+        keys[i] = 0;
+        // Trim trailing zeroes
+        while (*count > 0 && keys[*count - 1] == 0)
+            (*count)--;
+        return true;
+    }
+    return false;
+}
+
+// Always-on key cycle: capslock→enter→backspace→escape→capslock.
+// Applied before anything else, bypasses dvorak translation entirely.
+static int custom_cycle(int key) {
+    switch (key) {
+        case KEY_CAPSLOCK:  return KEY_ENTER;
+        case KEY_ENTER:     return KEY_BACKSPACE;
+        case KEY_BACKSPACE: return KEY_ESC;
+        case KEY_ESC:       return KEY_CAPSLOCK;
+        default:            return key;
+    }
+}
+
+// Swaps applied during normal typing (no modifier), before dvorak translation.
+// Keys are identified by what they output in Dvorak:
+//   ' "  <->  ; :   (KEY_Q position swaps with KEY_Z position)
+//   / ?  <->  z     (KEY_LEFTBRACE position swaps with KEY_SLASH position)
+static int custom_swap(int key) {
+    switch (key) {
+        case KEY_Q:          return KEY_Z;
+        case KEY_Z:          return KEY_Q;
+        case KEY_LEFTBRACE:  return KEY_SLASH;
+        case KEY_SLASH:      return KEY_LEFTBRACE;
+        default:             return key;
+    }
 }
 
 static void usage(const char *path) {
@@ -332,7 +351,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Start the uinput setup
-    int fdo = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    fdo = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fdo < 0) {
         fprintf(stderr, "Error: Failed to open /dev/uinput for device [%s]: %s.\n", device, strerror(errno));
         close(fdi);
@@ -401,106 +420,109 @@ int main(int argc, char *argv[]) {
 
     struct input_event ev = {0};
     int mod_state = 0,
-        array_qwerty_counter = 0;
+        remapped_count = 0;
 
-    unsigned int array_qwerty[MAX_LENGTH] = {0};
+    unsigned int remapped_keys[MAX_LENGTH] = {0};
+
+    // Emergency exit: hold F9+F10+F11+F12 simultaneously to release the grab
+    // and exit cleanly, leaving the keyboard in its normal passthrough state.
+    #define EMERGENCY_F9  (1 << 0)
+    #define EMERGENCY_F10 (1 << 1)
+    #define EMERGENCY_F11 (1 << 2)
+    #define EMERGENCY_F12 (1 << 3)
+    #define EMERGENCY_ALL (EMERGENCY_F9 | EMERGENCY_F10 | EMERGENCY_F11 | EMERGENCY_F12)
+    int emergency_state = 0;
+
+    static const struct { int key; int bit; } emergency_keys[] = {
+        { KEY_F9,  EMERGENCY_F9  },
+        { KEY_F10, EMERGENCY_F10 },
+        { KEY_F11, EMERGENCY_F11 },
+        { KEY_F12, EMERGENCY_F12 },
+    };
 
     fprintf(stderr, "Staring event loop with keyboard: [%s] for device [%s].\n", keyboard_name, device);
 
     while (keep_running) {
         ssize_t n = read(fdi, &ev, sizeof ev);
         if (n == (ssize_t) -1) {
-            if (errno == EINTR)
-                continue;
+            if (errno == EINTR) continue;
             break;
         } else if (n != sizeof ev) {
             break;
         }
 
-        if(ev.type == EV_KEY) {
-            int mod_current = modifier_bit(ev.code);
-
-            if (mod_current > 0) {
-                if (ev.value != 0) {
-                    //set mod state when either 1 (key press), or 2 (repeat)
-                    mod_state |= mod_current;
-                } else {
-                    //remove mod state when 0 (released)
-                    mod_state &= ~mod_current;
-                }
-            }
-
-            int qwerty_code = qwerty2dvorak(ev.code);
-            if (ev.code != qwerty_code) {
-                //pressed key
-                if (ev.value == 1) {
-                    //modifier pressed
-                    if(mod_state > 0) {
-                        if (array_qwerty_counter == MAX_LENGTH) {
-                            printf("warning, too many keys pressed: %d. %s 0x%04x (%d), arr:%d\n",
-                                MAX_LENGTH, ev.value == 1 ? "pressed" : "released", (int) ev.code, (int) ev.code,
-                                array_qwerty_counter);
-                        } else {
-                            array_qwerty[array_qwerty_counter++] = qwerty_code;
-                            //remap to qwerty - press key
-                            emit(fdo, ev.type, qwerty_code, ev.value, ev.time);
-                        }
-                    } else {
-                        //no modifier
-                        emit(fdo, ev.type, ev.code, ev.value, ev.time);
-                    }
-                } else if(ev.value == 2) {
-                    //repeating button
-                    bool is_in_array = false;
-                    for (int i = 0; i < array_qwerty_counter; i++) {
-                        if (array_qwerty[i] == qwerty_code) {
-                            is_in_array = true;
-                            break;
-                        }
-                    }
-                    if(is_in_array) {
-                        //this is a repeating qwerty
-                        emit(fdo, ev.type, qwerty_code, ev.value, ev.time);
-                    } else {
-                        //not in the array, regular key
-                        emit(fdo, ev.type, ev.code, ev.value, ev.time);
-                    }
-                } else if(ev.value == 0) {
-                    //release the key
-                    bool need_emit = false;
-                    for (int i = 0; i < array_qwerty_counter; i++) {
-                        if (array_qwerty[i] == qwerty_code) {
-                            array_qwerty[i] = 0;
-                            need_emit = true;
-                            break;
-                        }
-                    }
-                    if(need_emit) {
-                        int last_nonzero = -1;
-                        for (int i = 0; i < array_qwerty_counter; i++) {
-                            if (array_qwerty[i] != 0) {
-                                last_nonzero = i;
-                            }
-                        }
-                        array_qwerty_counter = last_nonzero + 1;
-                        //remap to qwerty - release key
-                        emit(fdo, ev.type, qwerty_code, ev.value, ev.time);
-                    } else {
-                        //regular dvorak key
-                        emit(fdo, ev.type, ev.code, ev.value, ev.time);
-                    }
-                } else {
-                    //this should not happen
-                    emit(fdo, ev.type, ev.code, ev.value, ev.time);
-                }
-            } else {
-                //regular dvorak key
-                emit(fdo, ev.type, ev.code, ev.value, ev.time);
-            }
-        } else {
-            //non regular key
+        // Non-key events pass straight through.
+        if (ev.type != EV_KEY) {
             emit(fdo, ev.type, ev.code, ev.value, ev.time);
+            continue;
         }
+
+        // Track emergency-exit key state and fire if all four are held.
+        for (int i = 0; i < 4; i++) {
+            if (ev.code != (unsigned)emergency_keys[i].key) continue;
+            if (ev.value != 0) emergency_state |=  emergency_keys[i].bit;
+            else               emergency_state &= ~emergency_keys[i].bit;
+        }
+        if (emergency_state == EMERGENCY_ALL) {
+            fprintf(stderr, "Emergency exit triggered (F9+F10+F11+F12): releasing grab.\n");
+            ioctl(fdi, EVIOCGRAB, 0);
+            close(fdo);
+            close(fdi);
+            return EXIT_SUCCESS;
+        }
+
+        // Track modifier state.
+        int mod_bit = modifier_bit(ev.code);
+        if (mod_bit) {
+            if (ev.value != 0) mod_state |=  mod_bit;  // press or repeat
+            else               mod_state &= ~mod_bit;  // release
+        }
+
+        // Cycle remap (capslock/enter/backspace/escape) is always active,
+        // takes priority over everything else, and bypasses dvorak translation.
+        int cycled = custom_cycle(ev.code);
+        if (cycled != ev.code) {
+            emit(fdo, ev.type, cycled, ev.value, ev.time);
+            continue;
+        }
+
+        // With a modifier held, pass physical keycodes through so shortcuts
+        // stay at their QWERTY positions.  Without a modifier, apply the
+        // custom swaps first, then the full dvorak translation.
+        int dvorak_code = (mod_state != 0)
+            ? ev.code
+            : dvorak_to_qwerty(custom_swap(ev.code));
+
+        // Keys that translate to themselves need no further work.
+        if (dvorak_code == ev.code) {
+            emit(fdo, ev.type, ev.code, ev.value, ev.time);
+            continue;
+        }
+
+        // Key press
+        if (ev.value == 1) {
+            if (remapped_count == MAX_LENGTH) {
+                fprintf(stderr, "Warning: too many simultaneous remapped keys (%d), dropping 0x%04x.\n",
+                        MAX_LENGTH, ev.code);
+            } else {
+                remapped_keys[remapped_count++] = dvorak_code;
+                emit(fdo, ev.type, dvorak_code, ev.value, ev.time);
+            }
+            continue;
+        }
+
+        // Key repeat
+        if (ev.value == 2) {
+            int code = remapped_find(remapped_keys, remapped_count, dvorak_code)
+                       ? dvorak_code : ev.code;
+            emit(fdo, ev.type, code, ev.value, ev.time);
+            continue;
+        }
+
+        // Key release (value == 0; anything else also falls here and passes through).
+        int code = remapped_remove(remapped_keys, &remapped_count, dvorak_code)
+                   ? dvorak_code : ev.code;
+        emit(fdo, ev.type, code, ev.value, ev.time);
     }
     close(fdi);
     close(fdo);
