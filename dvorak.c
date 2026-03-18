@@ -158,24 +158,29 @@ static bool setup_event_type(int fdo, unsigned long event_type, int max_val, con
     return true;
 }
 
-// Returns true if dvorak_code is in the remapped-keys tracking array.
-static bool remapped_find(const unsigned int *keys, int count, int dvorak_code) {
+// Tracks keys that were remapped on press, so release/repeat can emit
+// the correct code regardless of modifier state at that time.
+typedef struct { int original; int emitted; } KeyPair;
+
+// Returns the emitted code for original, or -1 if not found.
+static int remapped_find(const KeyPair *keys, int count, int original) {
     for (int i = 0; i < count; i++)
-        if ((int)keys[i] == dvorak_code) return true;
-    return false;
+        if (keys[i].original == original) return keys[i].emitted;
+    return -1;
 }
 
-// Removes dvorak_code from the tracking array. Returns true if it was present.
-static bool remapped_remove(unsigned int *keys, int *count, int dvorak_code) {
+// Removes the entry for original. Returns the emitted code, or -1 if not found.
+static int remapped_remove(KeyPair *keys, int *count, int original) {
     for (int i = 0; i < *count; i++) {
-        if ((int)keys[i] != dvorak_code) continue;
-        keys[i] = 0;
-        // Trim trailing zeroes
-        while (*count > 0 && keys[*count - 1] == 0)
+        if (keys[i].original != original) continue;
+        int emitted = keys[i].emitted;
+        keys[i] = (KeyPair){0, 0};
+        // Trim trailing empty entries
+        while (*count > 0 && keys[*count - 1].original == 0)
             (*count)--;
-        return true;
+        return emitted;
     }
-    return false;
+    return -1;
 }
 
 // Always-on key cycle: capslock→enter→backspace→escape→capslock.
@@ -422,7 +427,7 @@ int main(int argc, char *argv[]) {
     int mod_state = 0,
         remapped_count = 0;
 
-    unsigned int remapped_keys[MAX_LENGTH] = {0};
+    KeyPair remapped_keys[MAX_LENGTH] = {0};
 
     // Emergency exit: hold F9+F10+F11+F12 simultaneously to release the grab
     // and exit cleanly, leaving the keyboard in its normal passthrough state.
@@ -505,24 +510,22 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Warning: too many simultaneous remapped keys (%d), dropping 0x%04x.\n",
                         MAX_LENGTH, ev.code);
             } else {
-                remapped_keys[remapped_count++] = dvorak_code;
+                remapped_keys[remapped_count++] = (KeyPair){ ev.code, dvorak_code };
                 emit(fdo, ev.type, dvorak_code, ev.value, ev.time);
             }
             continue;
         }
 
-        // Key repeat
+        // Key repeat: look up by original code in case mod state changed since press.
         if (ev.value == 2) {
-            int code = remapped_find(remapped_keys, remapped_count, dvorak_code)
-                       ? dvorak_code : ev.code;
-            emit(fdo, ev.type, code, ev.value, ev.time);
+            int found = remapped_find(remapped_keys, remapped_count, ev.code);
+            emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
             continue;
         }
 
-        // Key release (value == 0; anything else also falls here and passes through).
-        int code = remapped_remove(remapped_keys, &remapped_count, dvorak_code)
-                   ? dvorak_code : ev.code;
-        emit(fdo, ev.type, code, ev.value, ev.time);
+        // Key release: same — look up by original, emit whatever was sent on press.
+        int found = remapped_remove(remapped_keys, &remapped_count, ev.code);
+        emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
     }
     close(fdi);
     close(fdo);
