@@ -7,21 +7,19 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <sys/time.h>
 
 //a key combination has a maximum amount of 8 characters. That should be enough.
 #define MAX_LENGTH 8
 
-static int fdi;
-static int fdo;
+static int fdi = -1;
+static int fdo = -1;
 static volatile sig_atomic_t keep_running = 1;
 static void sig_handler(int _sig) {
     (void)_sig;
     keep_running = 0;
-    // Releasing the grab before closing lets the kernel hand the device back
-    // to normal immediately rather than waiting for cleanup.
-    ioctl(fdi, EVIOCGRAB, 0);
-    close(fdi);
-    close(fdo);
+    // Cleanup (ungrab + close) happens in main after the loop exits.
+    // read() will return EINTR since we register without SA_RESTART.
 }
 
 //from: https://github.com/kentonv/dvorak-qwerty/tree/master/unix
@@ -40,12 +38,10 @@ static int modifier_bit(int key) {
     }
 }
 
-//from: https://github.com/kentonv/dvorak-qwerty/tree/master/unix
-// Maps a physical QWERTY scancode to the QWERTY scancode that produces
-// the same character under a Dvorak layout.  This is the inverse of
-// qwerty2dvorak and is used when the OS is in QWERTY mode so that
-// typing produces Dvorak characters.
-static int dvorak_to_qwerty(int key) {
+// Maps a physical QWERTY key to the keycode that produces the correct
+// Dvorak character when the OS layout is set to QWERTY.
+// e.g. physical 's' -> KEY_O because 's' position in Dvorak produces 'o'.
+static int dvorak_remap(int key) {
     switch (key) {
         case KEY_MINUS:      return KEY_LEFTBRACE;
         case KEY_EQUAL:      return KEY_RIGHTBRACE;
@@ -99,56 +95,48 @@ static bool has_event_type(const unsigned int array_bit_ev[], int event_type) {
     return (array_bit_ev[event_type/32] & (1U << (event_type % 32))) != 0;
 }
 
-static bool setup_event_type(int fdo, unsigned long event_type, int max_val, const unsigned int array_bit[]) {
-    struct uinput_abs_setup abs_setup = {};
-    bool abs_init_once = false;
-
+static bool setup_event_type(int out_fd, unsigned long event_type, int max_val, const unsigned int array_bit[]) {
     for (int i = 0; i < max_val; i++) {
-        if (!(array_bit[i / 32] & (1U << (i % 32)))) {
+        if (!(array_bit[i / 32] & (1U << (i % 32))))
             continue;
-        }
 
-        //fprintf(stderr, "Setting capability %d for event type %lu\n", i, event_type);
         switch(event_type) {
             case UI_SET_EVBIT:
-                if (ioctl(fdo, UI_SET_EVBIT, i) < 0) {
+                if (ioctl(out_fd, UI_SET_EVBIT, i) < 0) {
                     fprintf(stderr, "Cannot set EV bit %d: %s\n", i, strerror(errno));
                     return false;
                 }
                 break;
             case UI_SET_KEYBIT:
-                if (ioctl(fdo, UI_SET_KEYBIT, i) < 0) {
+                if (ioctl(out_fd, UI_SET_KEYBIT, i) < 0) {
                     fprintf(stderr, "Cannot set KEY bit %d: %s\n", i, strerror(errno));
                     return false;
                 }
                 break;
             case UI_SET_RELBIT:
-                if (ioctl(fdo, UI_SET_RELBIT, i) < 0) {
+                if (ioctl(out_fd, UI_SET_RELBIT, i) < 0) {
                     fprintf(stderr, "Cannot set REL bit %d: %s\n", i, strerror(errno));
                     return false;
                 }
                 break;
-            case UI_SET_ABSBIT:
-                if (!abs_init_once) {
-                    abs_setup.code = i;
-                    if (ioctl(fdi, EVIOCGABS(i), &abs_setup.absinfo) < 0) {
-                        fprintf(stderr, "Failed to get ABS info for axis %d: %s\n", i, strerror(errno));
-                        continue;
-                    }
-                    if (ioctl(fdo, UI_ABS_SETUP, &abs_setup) < 0) {
-                        fprintf(stderr, "Failed to setup ABS axis %d: %s\n", i, strerror(errno));
-                        continue;
-                    }
-                    abs_init_once = true;
+            case UI_SET_ABSBIT: {
+                struct uinput_abs_setup abs_setup = { .code = i };
+                if (ioctl(fdi, EVIOCGABS(i), &abs_setup.absinfo) < 0) {
+                    fprintf(stderr, "Failed to get ABS info for axis %d: %s\n", i, strerror(errno));
+                    continue;
                 }
-
-                if (ioctl(fdo, UI_SET_ABSBIT, i) < 0) {
+                if (ioctl(out_fd, UI_ABS_SETUP, &abs_setup) < 0) {
+                    fprintf(stderr, "Failed to setup ABS axis %d: %s\n", i, strerror(errno));
+                    continue;
+                }
+                if (ioctl(out_fd, UI_SET_ABSBIT, i) < 0) {
                     fprintf(stderr, "Cannot set ABS bit %d: %s\n", i, strerror(errno));
                     return false;
                 }
                 break;
+            }
             case UI_SET_MSCBIT:
-                if (ioctl(fdo, UI_SET_MSCBIT, i) < 0) {
+                if (ioctl(out_fd, UI_SET_MSCBIT, i) < 0) {
                     fprintf(stderr, "Cannot set MSC bit %d: %s\n", i, strerror(errno));
                     return false;
                 }
@@ -174,10 +162,11 @@ static int remapped_remove(KeyPair *keys, int *count, int original) {
     for (int i = 0; i < *count; i++) {
         if (keys[i].original != original) continue;
         int emitted = keys[i].emitted;
-        keys[i] = (KeyPair){0, 0};
-        // Trim trailing empty entries
-        while (*count > 0 && keys[*count - 1].original == 0)
-            (*count)--;
+        // Shift remaining entries down to keep array compact.
+        (*count)--;
+        for (int j = i; j < *count; j++)
+            keys[j] = keys[j + 1];
+        keys[*count] = (KeyPair){0, 0};
         return emitted;
     }
     return -1;
@@ -209,6 +198,8 @@ static int custom_swap(int key) {
     }
 }
 
+#define FAIL_FDI(msg, ...) do { fprintf(stderr, msg, ##__VA_ARGS__); close(fdi); return EXIT_FAILURE; } while(0)
+
 static void usage(const char *path) {
     /* take only the last portion of the path */
     const char *basename = strrchr(path, '/');
@@ -224,7 +215,12 @@ static void usage(const char *path) {
 }
 
 int main(int argc, char *argv[]) {
-    signal(SIGTERM, sig_handler);
+    // Use sigaction without SA_RESTART so that the blocking read() in the
+    // event loop returns EINTR when a signal arrives, allowing clean exit.
+    struct sigaction sa = { .sa_handler = sig_handler, .sa_flags = 0 };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
 
     int opt;
     char *device = NULL,
@@ -259,8 +255,7 @@ int main(int argc, char *argv[]) {
     }
 
     char keyboard_name[UINPUT_MAX_NAME_SIZE] = "Unknown";
-    int ret_val = ioctl(fdi, EVIOCGNAME(sizeof(keyboard_name) - 1), keyboard_name);
-    if (ret_val < 0) {
+    if (ioctl(fdi, EVIOCGNAME(sizeof(keyboard_name) - 1), keyboard_name) < 0) {
         fprintf(stderr, "Error: Unable to retrieve device name for [%s]: %s.\n", device, strerror(errno));
         fprintf(stderr, "Hint: Verify if the device is functional and properly configured.\n");
         close(fdi);
@@ -277,18 +272,15 @@ int main(int argc, char *argv[]) {
         return EXIT_SUCCESS;
     }
 
-    ret_val = -1;
     if (match != NULL) {
-        char *token = strtok(match, " ");
-        while (token != NULL) {
-            if (strcasestr(keyboard_name, token) != NULL) {
-                printf("Info: Found matching input: [%s] for device [%s].\n", keyboard_name, device);
-                ret_val = 0;
-                break;
-            }
-            token = strtok(NULL, " ");
+        bool matched = false;
+        for (char *token = strtok(match, " "); token != NULL; token = strtok(NULL, " ")) {
+            if (strcasestr(keyboard_name, token) == NULL) continue;
+            fprintf(stdout, "Info: Found matching input: [%s] for device [%s].\n", keyboard_name, device);
+            matched = true;
+            break;
         }
-        if (ret_val < 0) {
+        if (!matched) {
             fprintf(stderr, "Error: Device [%s] does not match any of the specified keywords: [%s].\n", keyboard_name, match);
             close(fdi);
             return EXIT_FAILURE;
@@ -303,48 +295,20 @@ int main(int argc, char *argv[]) {
         array_bit_abs[ABS_MAX/32 + 1]= {0},
         array_bit_msc[MSC_MAX/32 + 1]= {0};
 
-    ret_val = ioctl(fdi, EVIOCGBIT(0, sizeof(array_bit_ev)), &array_bit_ev);
-    if (ret_val < 0) {
-        fprintf(stderr, "Error: Failed to retrieve event capabilities for device [%s]: %s.\n", device, strerror(errno));
-        close(fdi);
-        return EXIT_FAILURE;
-    }
+    if (ioctl(fdi, EVIOCGBIT(0, sizeof(array_bit_ev)), &array_bit_ev) < 0)
+        FAIL_FDI("Error: Failed to retrieve event capabilities for device [%s]: %s.\n", device, strerror(errno));
 
-    if (has_event_type(array_bit_ev, EV_KEY)) {
-        ret_val = ioctl(fdi, EVIOCGBIT(EV_KEY, sizeof(array_bit_key)), &array_bit_key);
-        if (ret_val < 0) {
-            fprintf(stderr, "Error: Failed to retrieve EV_KEY capabilities for device [%s]: %s.\n", device, strerror(errno));
-            close(fdi);
-            return EXIT_FAILURE;
-        }
-    }
+    if (has_event_type(array_bit_ev, EV_KEY) && ioctl(fdi, EVIOCGBIT(EV_KEY, sizeof(array_bit_key)), &array_bit_key) < 0)
+        FAIL_FDI("Error: Failed to retrieve EV_KEY capabilities for device [%s]: %s.\n", device, strerror(errno));
 
-    if (has_event_type(array_bit_ev, EV_REL)) {
-        ret_val = ioctl(fdi, EVIOCGBIT(EV_REL, sizeof(array_bit_rel)), &array_bit_rel);
-        if (ret_val < 0) {
-            fprintf(stderr, "Error: Failed to retrieve EV_REL capabilities for device [%s]: %s.\n", device, strerror(errno));
-            close(fdi);
-            return EXIT_FAILURE;
-        }
-    }
+    if (has_event_type(array_bit_ev, EV_REL) && ioctl(fdi, EVIOCGBIT(EV_REL, sizeof(array_bit_rel)), &array_bit_rel) < 0)
+        FAIL_FDI("Error: Failed to retrieve EV_REL capabilities for device [%s]: %s.\n", device, strerror(errno));
 
-    if (has_event_type(array_bit_ev, EV_ABS)) {
-        ret_val = ioctl(fdi, EVIOCGBIT(EV_ABS, sizeof(array_bit_abs)), &array_bit_abs);
-        if (ret_val < 0) {
-            fprintf(stderr, "Error: Failed to retrieve EV_ABS capabilities for device [%s]: %s.\n", device, strerror(errno));
-            close(fdi);
-            return EXIT_FAILURE;
-        }
-    }
+    if (has_event_type(array_bit_ev, EV_ABS) && ioctl(fdi, EVIOCGBIT(EV_ABS, sizeof(array_bit_abs)), &array_bit_abs) < 0)
+        FAIL_FDI("Error: Failed to retrieve EV_ABS capabilities for device [%s]: %s.\n", device, strerror(errno));
 
-    if (has_event_type(array_bit_ev, EV_MSC)) {
-        ret_val = ioctl(fdi, EVIOCGBIT(EV_MSC, sizeof(array_bit_msc)), &array_bit_msc);
-        if (ret_val < 0) {
-            fprintf(stderr, "Error: Failed to retrieve EV_MSC capabilities for device [%s]: %s.\n", device, strerror(errno));
-            close(fdi);
-            return EXIT_FAILURE;
-        }
-    }
+    if (has_event_type(array_bit_ev, EV_MSC) && ioctl(fdi, EVIOCGBIT(EV_MSC, sizeof(array_bit_msc)), &array_bit_msc) < 0)
+        FAIL_FDI("Error: Failed to retrieve EV_MSC capabilities for device [%s]: %s.\n", device, strerror(errno));
 
     //Check we are a keyboard
     if (!(array_bit_key[KEY_X / 32] & (1 << (KEY_X % 32))) ||
@@ -355,13 +319,17 @@ int main(int argc, char *argv[]) {
         return EXIT_SUCCESS;
     }
 
-    // Start the uinput setup
+    // Start the uinput setup.
+    // O_NONBLOCK prevents open() from blocking during device initialisation,
+    // but we clear it immediately so that writes block rather than silently
+    // failing with EAGAIN under load.
     fdo = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fdo < 0) {
         fprintf(stderr, "Error: Failed to open /dev/uinput for device [%s]: %s.\n", device, strerror(errno));
         close(fdi);
         return EXIT_FAILURE;
     }
+    fcntl(fdo, F_SETFL, fcntl(fdo, F_GETFL) & ~O_NONBLOCK);
 
     // Configure the virtual device
     if (ioctl(fdo, UI_DEV_SETUP, &usetup) < 0) {
@@ -445,7 +413,7 @@ int main(int argc, char *argv[]) {
         { KEY_F12, EMERGENCY_F12 },
     };
 
-    fprintf(stderr, "Staring event loop with keyboard: [%s] for device [%s].\n", keyboard_name, device);
+    fprintf(stderr, "Starting event loop with keyboard: [%s] for device [%s].\n", keyboard_name, device);
 
     while (keep_running) {
         ssize_t n = read(fdi, &ev, sizeof ev);
@@ -483,51 +451,69 @@ int main(int argc, char *argv[]) {
             else               mod_state &= ~mod_bit;  // release
         }
 
-        // Cycle remap (capslock/enter/backspace/escape) is always active,
-        // takes priority over everything else, and bypasses dvorak translation.
+        // Cycle remap (capslock/enter/backspace/escape) is always active and
+        // must be checked before the repeat/release paths so that all three
+        // event types (press, repeat, release) are translated consistently.
+        // Without this, the OS sees mismatched down/up keycodes → stuck keys.
         int cycled = custom_cycle(ev.code);
         if (cycled != ev.code) {
             emit(fdo, ev.type, cycled, ev.value, ev.time);
             continue;
         }
 
-        // With a modifier held, pass physical keycodes through so shortcuts
-        // stay at their QWERTY positions.  Without a modifier, apply the
-        // custom swaps first, then the full dvorak translation.
-        int dvorak_code = (mod_state != 0)
-            ? ev.code
-            : dvorak_to_qwerty(custom_swap(ev.code));
-
-        // Keys that translate to themselves need no further work.
-        if (dvorak_code == ev.code) {
-            emit(fdo, ev.type, ev.code, ev.value, ev.time);
-            continue;
-        }
-
-        // Key press
-        if (ev.value == 1) {
-            if (remapped_count == MAX_LENGTH) {
-                fprintf(stderr, "Warning: too many simultaneous remapped keys (%d), dropping 0x%04x.\n",
-                        MAX_LENGTH, ev.code);
-            } else {
-                remapped_keys[remapped_count++] = (KeyPair){ ev.code, dvorak_code };
-                emit(fdo, ev.type, dvorak_code, ev.value, ev.time);
-            }
-            continue;
-        }
-
-        // Key repeat: look up by original code in case mod state changed since press.
+        // Repeat and release are resolved from the tracking array using the
+        // original keycode, before any translation.  This is critical: mod
+        // state may have changed since the key was pressed, so recomputing
+        // dvorak_code here would give the wrong answer and leak array entries.
         if (ev.value == 2) {
             int found = remapped_find(remapped_keys, remapped_count, ev.code);
             emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
             continue;
         }
+        if (ev.value == 0) {
+            int found = remapped_remove(remapped_keys, &remapped_count, ev.code);
+            emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
+            continue;
+        }
 
-        // Key release: same — look up by original, emit whatever was sent on press.
-        int found = remapped_remove(remapped_keys, &remapped_count, ev.code);
-        emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
+        // From here on we only have key presses (value == 1).
+
+        // With a modifier held, pass physical keycodes through so shortcuts
+        // stay at their QWERTY positions.  Without a modifier, apply the
+        // custom swaps first, then the full dvorak translation.
+        int dvorak_code = (mod_state != 0)
+            ? ev.code
+            : dvorak_remap(custom_swap(ev.code));
+
+        // Keys that translate to themselves need no tracking.
+        if (dvorak_code == ev.code) {
+            emit(fdo, ev.type, ev.code, ev.value, ev.time);
+            continue;
+        }
+
+        // Remapped key press: track original→emitted so release can find it.
+        if (remapped_count == MAX_LENGTH) {
+            fprintf(stderr, "Warning: too many simultaneous remapped keys (%d), dropping 0x%04x.\n",
+                    MAX_LENGTH, ev.code);
+        } else {
+            remapped_keys[remapped_count++] = (KeyPair){ ev.code, dvorak_code };
+            emit(fdo, ev.type, dvorak_code, ev.value, ev.time);
+        }
     }
-    close(fdi);
-    close(fdo);
+    // Release any keys that were held when the loop exited, so the OS doesn't
+    // see stuck keys after the virtual device is destroyed.
+    // Each key-up must be followed by EV_SYN/SYN_REPORT — unlike normal
+    // operation where SYN events come automatically from the physical device's
+    // event stream, here we have to emit them manually.
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    for (int i = 0; i < remapped_count; i++) {
+        if (remapped_keys[i].original == 0) continue;
+        emit(fdo, EV_KEY, remapped_keys[i].emitted, 0, now);
+        emit(fdo, EV_SYN, SYN_REPORT, 0, now);
+    }
+    if (fdi >= 0) ioctl(fdi, EVIOCGRAB, 0);
+    if (fdi >= 0) close(fdi);
+    if (fdo >= 0) close(fdo);
     return EXIT_SUCCESS;
 }
