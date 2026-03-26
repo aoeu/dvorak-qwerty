@@ -1,7 +1,20 @@
 [Unit]
-Description=Dvorak Virtual Keyboard
+Description=Dvorak keyboard remapper for /dev/input/%i
+After=dev-input-%i.device
+BindsTo=dev-input-%i.device
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Service]
+Type=simple
 ExecStart=/usr/local/bin/dvorak -d /dev/input/%i
-StandardOutput=null
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=5
+OOMScoreAdjust=-500
+User=dvorak
+Group=input
 StandardError=journal
+
+# No [Install] section — this is a template service started by udev,
+# not by systemctl enable. See 80-dvorak.rules.
