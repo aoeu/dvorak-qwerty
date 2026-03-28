@@ -214,6 +214,7 @@ static void usage(const char *path) {
     fprintf(stderr, "example: %s -u -d /dev/input/by-id/usb-Logitech_USB_Receiver-if02-event-kbd -m \"k750 k350\"\n", basename);
 }
 
+#ifndef DVORAK_TEST
 int main(int argc, char *argv[]) {
     // Use sigaction without SA_RESTART so that the blocking read() in the
     // event loop returns EINTR when a signal arrives, allowing clean exit.
@@ -394,24 +395,9 @@ int main(int argc, char *argv[]) {
     struct input_event ev = {0};
     int mod_state = 0,
         remapped_count = 0;
+    bool remapping_enabled = true;
 
     KeyPair remapped_keys[MAX_LENGTH] = {0};
-
-    // Emergency exit: hold F9+F10+F11+F12 simultaneously to release the grab
-    // and exit cleanly, leaving the keyboard in its normal passthrough state.
-    #define EMERGENCY_F9  (1 << 0)
-    #define EMERGENCY_F10 (1 << 1)
-    #define EMERGENCY_F11 (1 << 2)
-    #define EMERGENCY_F12 (1 << 3)
-    #define EMERGENCY_ALL (EMERGENCY_F9 | EMERGENCY_F10 | EMERGENCY_F11 | EMERGENCY_F12)
-    int emergency_state = 0;
-
-    static const struct { int key; int bit; } emergency_keys[] = {
-        { KEY_F9,  EMERGENCY_F9  },
-        { KEY_F10, EMERGENCY_F10 },
-        { KEY_F11, EMERGENCY_F11 },
-        { KEY_F12, EMERGENCY_F12 },
-    };
 
     fprintf(stderr, "Starting event loop with keyboard: [%s] for device [%s].\n", keyboard_name, device);
 
@@ -430,18 +416,28 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Track emergency-exit key state and fire if all four are held.
-        for (int i = 0; i < 4; i++) {
-            if (ev.code != (unsigned)emergency_keys[i].key) continue;
-            if (ev.value != 0) emergency_state |=  emergency_keys[i].bit;
-            else               emergency_state &= ~emergency_keys[i].bit;
+        // Pause key toggles remapping on/off.  Only fires on press, not repeat/release.
+        if (ev.code == KEY_PAUSE && ev.value == 1) {
+            remapping_enabled = !remapping_enabled;
+            fprintf(stderr, "Remapping %s.\n", remapping_enabled ? "enabled" : "disabled");
+            // Flush any held remapped keys so nothing gets stuck on toggle.
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            for (int i = 0; i < remapped_count; i++) {
+                if (remapped_keys[i].original == 0) continue;
+                emit(fdo, EV_KEY, remapped_keys[i].emitted, 0, now);
+                emit(fdo, EV_SYN, SYN_REPORT, 0, now);
+            }
+            remapped_count = 0;
+            memset(remapped_keys, 0, sizeof(remapped_keys));
+            mod_state = 0;
+            continue;
         }
-        if (emergency_state == EMERGENCY_ALL) {
-            fprintf(stderr, "Emergency exit triggered (F9+F10+F11+F12): releasing grab.\n");
-            ioctl(fdi, EVIOCGRAB, 0);
-            close(fdo);
-            close(fdi);
-            return EXIT_SUCCESS;
+
+        // When remapping is disabled, pass everything straight through.
+        if (!remapping_enabled) {
+            emit(fdo, ev.type, ev.code, ev.value, ev.time);
+            continue;
         }
 
         // Track modifier state.
@@ -517,3 +513,4 @@ int main(int argc, char *argv[]) {
     if (fdo >= 0) close(fdo);
     return EXIT_SUCCESS;
 }
+#endif // DVORAK_TEST
