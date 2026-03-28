@@ -198,6 +198,102 @@ static int custom_swap(int key) {
     }
 }
 
+// Space-as-meta: hold space and press another key to use space as Left Meta.
+// Runs on already-remapped keycodes, after dvorak_remap/custom_swap.
+// Based on https://gitlab.com/interception/linux/plugins/space2meta
+#define SM_DELAY_US 20000
+
+typedef enum { SM_START, SM_SPACE_HELD, SM_KEY_HELD, SM_SPACE_IS_META } SmState;
+
+static struct {
+    SmState            state;
+    struct input_event key_held; // buffered key press, waiting to be emitted
+} sm = {0};
+
+static void sm_emit(int out_fd, int type, int code, int value, struct timeval time) {
+    switch (sm.state) {
+
+        case SM_START:
+            if (type == EV_KEY && code == KEY_SPACE && value == 1) {
+                sm.state = SM_SPACE_HELD;
+                return; // buffer space, wait to see what follows
+            }
+            emit(out_fd, type, code, value, time);
+            return;
+
+        case SM_SPACE_HELD:
+            if (type == EV_KEY && code == KEY_SPACE) {
+                if (value) return; // suppress repeat
+                // space released alone — tap it as a real space key
+                emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+                usleep(SM_DELAY_US);
+                emit(out_fd, EV_KEY, KEY_SPACE, 0, time);
+                sm.state = SM_START;
+                return;
+            }
+            if (type == EV_KEY && value == 1) {
+                // another key pressed — buffer it, commit on the next event
+                sm.key_held = (struct input_event){
+                    .type = type, .code = code, .value = value, .time = time };
+                sm.state = SM_KEY_HELD;
+                return;
+            }
+            if (type == EV_KEY) {
+                // key release or repeat of a key held before space was pressed
+                emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+                usleep(SM_DELAY_US);
+                emit(out_fd, type, code, value, time);
+                sm.state = SM_START;
+                return;
+            }
+            // non-key event (e.g. mouse move) while space held — activate meta
+            emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, time);
+            emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+            usleep(SM_DELAY_US);
+            emit(out_fd, type, code, value, time);
+            sm.state = SM_SPACE_IS_META;
+            return;
+
+        case SM_KEY_HELD:
+            // suppress repeats of space or the buffered key while deciding
+            if (type == EV_KEY && (code == KEY_SPACE || code == sm.key_held.code) && value)
+                return;
+            if (type == EV_KEY && code == KEY_SPACE) {
+                // space released before another event — space was just a prefix, not meta
+                emit(out_fd, EV_KEY, KEY_SPACE,        1,                  sm.key_held.time);
+                emit(out_fd, EV_SYN, SYN_REPORT,       0,                  time);
+                usleep(SM_DELAY_US);
+                emit(out_fd, sm.key_held.type, sm.key_held.code, sm.key_held.value, sm.key_held.time);
+                emit(out_fd, EV_SYN, SYN_REPORT,       0,                  time);
+                usleep(SM_DELAY_US);
+                emit(out_fd, type,   code,              value,              time);
+                sm.state = SM_START;
+            } else {
+                // another event arrived — commit: space becomes meta
+                emit(out_fd, EV_KEY, KEY_LEFTMETA,     1,                  sm.key_held.time);
+                emit(out_fd, EV_SYN, SYN_REPORT,       0,                  time);
+                usleep(SM_DELAY_US);
+                emit(out_fd, sm.key_held.type, sm.key_held.code, sm.key_held.value, sm.key_held.time);
+                emit(out_fd, EV_SYN, SYN_REPORT,       0,                  time);
+                usleep(SM_DELAY_US);
+                emit(out_fd, type,   code,              value,              time);
+                sm.state = SM_SPACE_IS_META;
+            }
+            return;
+
+        case SM_SPACE_IS_META:
+            if (type == EV_KEY && code == KEY_SPACE) {
+                if (value == 0) sm.state = SM_START;
+                emit(out_fd, EV_KEY, KEY_LEFTMETA, value, time);
+                return;
+            }
+            emit(out_fd, type, code, value, time);
+            return;
+    }
+}
+
 #define FAIL_FDI(msg, ...) do { fprintf(stderr, msg, ##__VA_ARGS__); close(fdi); return EXIT_FAILURE; } while(0)
 
 static void usage(const char *path) {
@@ -410,9 +506,10 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Non-key events pass straight through.
+        // Non-key events pass through the space2meta filter (a mouse move
+        // while space is held should activate meta, not be dropped).
         if (ev.type != EV_KEY) {
-            emit(fdo, ev.type, ev.code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, ev.code, ev.value, ev.time);
             continue;
         }
 
@@ -431,6 +528,7 @@ int main(int argc, char *argv[]) {
             remapped_count = 0;
             memset(remapped_keys, 0, sizeof(remapped_keys));
             mod_state = 0;
+            sm = (typeof(sm)){0}; // reset space2meta state
             continue;
         }
 
@@ -453,7 +551,7 @@ int main(int argc, char *argv[]) {
         // Without this, the OS sees mismatched down/up keycodes → stuck keys.
         int cycled = custom_cycle(ev.code);
         if (cycled != ev.code) {
-            emit(fdo, ev.type, cycled, ev.value, ev.time);
+            sm_emit(fdo, ev.type, cycled, ev.value, ev.time);
             continue;
         }
 
@@ -463,12 +561,12 @@ int main(int argc, char *argv[]) {
         // dvorak_code here would give the wrong answer and leak array entries.
         if (ev.value == 2) {
             int found = remapped_find(remapped_keys, remapped_count, ev.code);
-            emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
             continue;
         }
         if (ev.value == 0) {
             int found = remapped_remove(remapped_keys, &remapped_count, ev.code);
-            emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
             continue;
         }
 
@@ -483,7 +581,7 @@ int main(int argc, char *argv[]) {
 
         // Keys that translate to themselves need no tracking.
         if (dvorak_code == ev.code) {
-            emit(fdo, ev.type, ev.code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, ev.code, ev.value, ev.time);
             continue;
         }
 
@@ -493,7 +591,7 @@ int main(int argc, char *argv[]) {
                     MAX_LENGTH, ev.code);
         } else {
             remapped_keys[remapped_count++] = (KeyPair){ ev.code, dvorak_code };
-            emit(fdo, ev.type, dvorak_code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, dvorak_code, ev.value, ev.time);
         }
     }
     // Release any keys that were held when the loop exited, so the OS doesn't
