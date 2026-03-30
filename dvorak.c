@@ -199,32 +199,39 @@ static int custom_swap(int key) {
 }
 
 // Space-as-meta: hold space and press another key to use space as Left Meta.
-// Runs on already-remapped keycodes, after dvorak_remap/custom_swap.
+// sm_emit receives both the raw physical keycode (raw_code) and the
+// dvorak-remapped keycode (mapped_code).  Meta chord paths emit raw_code
+// so that Space+Y produces Meta+Y (QWERTY position), not Meta+F (Dvorak).
+// Tap/character paths emit mapped_code so Space→space and buffered keys
+// produce the correct Dvorak characters.
 // Based on https://gitlab.com/interception/linux/plugins/space2meta
 #define SM_DELAY_US 20000
 
 typedef enum { SM_START, SM_SPACE_HELD, SM_KEY_HELD, SM_SPACE_IS_META } SmState;
 
 static struct {
-    SmState            state;
-    struct input_event key_held; // buffered key press, waiting to be emitted
+    SmState state;
+    struct timeval key_held_time;
+    int key_held_raw;    // physical keycode — used for meta chord emission
+    int key_held_mapped; // dvorak keycode  — used for tap/character emission
 } sm = {0};
 
-static void sm_emit(int out_fd, int type, int code, int value, struct timeval time) {
+static void sm_emit(int out_fd, int type, int raw_code, int mapped_code,
+                    int value, struct timeval time) {
     switch (sm.state) {
 
         case SM_START:
-            if (type == EV_KEY && code == KEY_SPACE && value == 1) {
+            if (type == EV_KEY && raw_code == KEY_SPACE && value == 1) {
                 sm.state = SM_SPACE_HELD;
                 return; // buffer space, wait to see what follows
             }
-            emit(out_fd, type, code, value, time);
+            emit(out_fd, type, mapped_code, value, time);
             return;
 
         case SM_SPACE_HELD:
-            if (type == EV_KEY && code == KEY_SPACE) {
+            if (type == EV_KEY && raw_code == KEY_SPACE) {
                 if (value) return; // suppress repeat
-                // space released alone — tap it as a real space key
+                // space released alone — emit a real space tap
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
                 usleep(SM_DELAY_US);
@@ -233,63 +240,73 @@ static void sm_emit(int out_fd, int type, int code, int value, struct timeval ti
                 return;
             }
             if (type == EV_KEY && value == 1) {
-                // another key pressed — buffer it, commit on the next event
-                sm.key_held = (struct input_event){
-                    .type = type, .code = code, .value = value, .time = time };
+                // another key pressed — buffer it, resolve on next event
+                sm.key_held_raw    = raw_code;
+                sm.key_held_mapped = mapped_code;
+                sm.key_held_time   = time;
                 sm.state = SM_KEY_HELD;
                 return;
             }
             if (type == EV_KEY) {
-                // key release or repeat of a key held before space was pressed
+                // release/repeat of a key that was held before space was pressed
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
                 usleep(SM_DELAY_US);
-                emit(out_fd, type, code, value, time);
+                emit(out_fd, type, mapped_code, value, time);
                 sm.state = SM_START;
                 return;
             }
-            // non-key event (e.g. mouse move) while space held — activate meta
-            emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, time);
-            emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-            usleep(SM_DELAY_US);
-            emit(out_fd, type, code, value, time);
-            sm.state = SM_SPACE_IS_META;
+            if (type == EV_REL || type == EV_ABS) {
+                // mouse/joystick movement while space held — activate meta
+                emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, time);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+                usleep(SM_DELAY_US);
+                emit(out_fd, type, raw_code, value, time);
+                sm.state = SM_SPACE_IS_META;
+                return;
+            }
+            // EV_SYN or other — pass through without changing state
+            emit(out_fd, type, mapped_code, value, time);
             return;
 
         case SM_KEY_HELD:
             // suppress repeats of space or the buffered key while deciding
-            if (type == EV_KEY && (code == KEY_SPACE || code == sm.key_held.code) && value)
+            if (type == EV_KEY && (raw_code == KEY_SPACE || raw_code == sm.key_held_raw) && value)
                 return;
-            if (type == EV_KEY && code == KEY_SPACE) {
-                // space released before another event — space was just a prefix, not meta
-                emit(out_fd, EV_KEY, KEY_SPACE,        1,                  sm.key_held.time);
-                emit(out_fd, EV_SYN, SYN_REPORT,       0,                  time);
+            if (type == EV_KEY && raw_code == KEY_SPACE) {
+                // space released — it was just a prefix, not meta; emit tap
+                emit(out_fd, EV_KEY,  KEY_SPACE,            1,                    sm.key_held_time);
+                emit(out_fd, EV_SYN,  SYN_REPORT,           0,                    time);
                 usleep(SM_DELAY_US);
-                emit(out_fd, sm.key_held.type, sm.key_held.code, sm.key_held.value, sm.key_held.time);
-                emit(out_fd, EV_SYN, SYN_REPORT,       0,                  time);
+                emit(out_fd, EV_KEY,  sm.key_held_mapped,   1,                    sm.key_held_time);
+                emit(out_fd, EV_SYN,  SYN_REPORT,           0,                    time);
                 usleep(SM_DELAY_US);
-                emit(out_fd, type,   code,              value,              time);
+                emit(out_fd, type,    mapped_code,           value,                time);
                 sm.state = SM_START;
-            } else {
-                // another event arrived — commit: space becomes meta
-                emit(out_fd, EV_KEY, KEY_LEFTMETA,     1,                  sm.key_held.time);
-                emit(out_fd, EV_SYN, SYN_REPORT,       0,                  time);
+            } else if (type == EV_KEY || type == EV_REL || type == EV_ABS) {
+                // another event — commit: space becomes meta, use raw keycodes
+                emit(out_fd, EV_KEY,  KEY_LEFTMETA,         1,                    sm.key_held_time);
+                emit(out_fd, EV_SYN,  SYN_REPORT,           0,                    time);
                 usleep(SM_DELAY_US);
-                emit(out_fd, sm.key_held.type, sm.key_held.code, sm.key_held.value, sm.key_held.time);
-                emit(out_fd, EV_SYN, SYN_REPORT,       0,                  time);
+                emit(out_fd, EV_KEY,  sm.key_held_raw,      1,                    sm.key_held_time);
+                emit(out_fd, EV_SYN,  SYN_REPORT,           0,                    time);
                 usleep(SM_DELAY_US);
-                emit(out_fd, type,   code,              value,              time);
+                emit(out_fd, type,    raw_code,              value,                time);
                 sm.state = SM_SPACE_IS_META;
+            } else {
+                // EV_SYN or other — pass through without changing state
+                emit(out_fd, type, mapped_code, value, time);
             }
             return;
 
         case SM_SPACE_IS_META:
-            if (type == EV_KEY && code == KEY_SPACE) {
+            if (type == EV_KEY && raw_code == KEY_SPACE) {
                 if (value == 0) sm.state = SM_START;
                 emit(out_fd, EV_KEY, KEY_LEFTMETA, value, time);
                 return;
             }
-            emit(out_fd, type, code, value, time);
+            // In meta mode all keys use raw (QWERTY) positions
+            emit(out_fd, type, raw_code, value, time);
             return;
     }
 }
@@ -506,10 +523,16 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Non-key events pass through the space2meta filter (a mouse move
-        // while space is held should activate meta, not be dropped).
+        // EV_REL and EV_ABS (mouse/joystick movement) go through the space2meta
+        // filter — movement while space is held should activate meta.
+        // EV_SYN and all other non-key events pass straight through without
+        // touching the state machine (otherwise EV_SYN after a space press
+        // would immediately trigger meta activation).
         if (ev.type != EV_KEY) {
-            sm_emit(fdo, ev.type, ev.code, ev.value, ev.time);
+            if (ev.type == EV_REL || ev.type == EV_ABS)
+                sm_emit(fdo, ev.type, ev.code, ev.code, ev.value, ev.time);
+            else
+                emit(fdo, ev.type, ev.code, ev.value, ev.time);
             continue;
         }
 
@@ -551,7 +574,7 @@ int main(int argc, char *argv[]) {
         // Without this, the OS sees mismatched down/up keycodes → stuck keys.
         int cycled = custom_cycle(ev.code);
         if (cycled != ev.code) {
-            sm_emit(fdo, ev.type, cycled, ev.value, ev.time);
+            sm_emit(fdo, ev.type, cycled, cycled, ev.value, ev.time);
             continue;
         }
 
@@ -561,27 +584,28 @@ int main(int argc, char *argv[]) {
         // dvorak_code here would give the wrong answer and leak array entries.
         if (ev.value == 2) {
             int found = remapped_find(remapped_keys, remapped_count, ev.code);
-            sm_emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, ev.code, found >= 0 ? found : ev.code, ev.value, ev.time);
             continue;
         }
         if (ev.value == 0) {
             int found = remapped_remove(remapped_keys, &remapped_count, ev.code);
-            sm_emit(fdo, ev.type, found >= 0 ? found : ev.code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, ev.code, found >= 0 ? found : ev.code, ev.value, ev.time);
             continue;
         }
 
         // From here on we only have key presses (value == 1).
 
-        // With a modifier held, pass physical keycodes through so shortcuts
-        // stay at their QWERTY positions.  Without a modifier, apply the
-        // custom swaps first, then the full dvorak translation.
+        // Without a modifier, apply custom swaps then full dvorak translation.
+        // With any modifier held, raw QWERTY codes pass through for shortcuts.
+        // sm.state is checked inside sm_emit — SM_SPACE_IS_META is handled
+        // there by emitting raw_code on all keys.
         int dvorak_code = (mod_state != 0)
             ? ev.code
             : dvorak_remap(custom_swap(ev.code));
 
         // Keys that translate to themselves need no tracking.
         if (dvorak_code == ev.code) {
-            sm_emit(fdo, ev.type, ev.code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, ev.code, ev.code, ev.value, ev.time);
             continue;
         }
 
@@ -591,7 +615,7 @@ int main(int argc, char *argv[]) {
                     MAX_LENGTH, ev.code);
         } else {
             remapped_keys[remapped_count++] = (KeyPair){ ev.code, dvorak_code };
-            sm_emit(fdo, ev.type, dvorak_code, ev.value, ev.time);
+            sm_emit(fdo, ev.type, ev.code, dvorak_code, ev.value, ev.time);
         }
     }
     // Release any keys that were held when the loop exited, so the OS doesn't
