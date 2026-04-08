@@ -12,7 +12,10 @@ all: dvorak.c
 run:
 	sudo ./dvorak -d /dev/input/by-id/usb-SONiX_USB_DEVICE-event-kbd
 
+stop:
+	systemctl stop 'dvorak@*.service'
 
+test:
 	$(CC) $(CFLAGS) -DDVORAK_TEST -o test_dvorak test_dvorak.c
 	./test_dvorak
 
