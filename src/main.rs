@@ -10,14 +10,16 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use std::fs::{File, OpenOptions};
 use std::mem;
-use std::os::unix::io::RawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use libc::{c_int, c_ulong, c_void, timeval, EINTR, F_GETFL, F_SETFL, O_NONBLOCK, O_RDONLY, O_WRONLY};
+use libc::{c_int, c_ulong, c_void, timeval, EINTR, F_GETFL, F_SETFL, O_NONBLOCK};
 
 // ── Linux input / uinput constants ───────────────────────────────────────────
 
@@ -199,12 +201,11 @@ fn emit(fd: RawFd, ev_type: u16, code: u16, value: i32, time: timeval) {
     let ev = InputEvent { time, ev_type, code, value };
     // SAFETY: `ev` is a valid, fully-initialised repr(C) struct; write() is
     // inherently unsafe but there is no alternative for uinput I/O.
-    unsafe {
-        libc::write(
-            fd,
-            &ev as *const InputEvent as *const c_void,
-            mem::size_of::<InputEvent>(),
-        );
+    let n = unsafe {
+        libc::write(fd, &ev as *const InputEvent as *const c_void, mem::size_of::<InputEvent>())
+    };
+    if n < 0 {
+        eprintln!("Warning: uinput write failed: {}", std::io::Error::last_os_error());
     }
 }
 
@@ -224,41 +225,39 @@ fn modifier_bit(key: u16) -> i32 {
 /// Dvorak character when the OS layout is set to QWERTY.
 fn dvorak_remap(key: u16) -> u16 {
     match key {
-        KEY_MINUS => KEY_LEFTBRACE,
-        KEY_EQUAL => KEY_RIGHTBRACE,
-        KEY_Q => KEY_APOSTROPHE,
-        KEY_W => KEY_COMMA,
-        KEY_E => KEY_DOT,
-        KEY_R => KEY_P,
-        KEY_T => KEY_Y,
-        KEY_Y => KEY_F,
-        KEY_U => KEY_G,
-        KEY_I => KEY_C,
-        KEY_O => KEY_R,
-        KEY_P => KEY_L,
-        KEY_LEFTBRACE => KEY_SLASH,
+        KEY_MINUS      => KEY_LEFTBRACE,
+        KEY_EQUAL      => KEY_RIGHTBRACE,
+        KEY_Q          => KEY_APOSTROPHE,
+        KEY_W          => KEY_COMMA,
+        KEY_E          => KEY_DOT,
+        KEY_R          => KEY_P,
+        KEY_T          => KEY_Y,
+        KEY_Y          => KEY_F,
+        KEY_U          => KEY_G,
+        KEY_I          => KEY_C,
+        KEY_O          => KEY_R,
+        KEY_P          => KEY_L,
+        KEY_LEFTBRACE  => KEY_SLASH,
         KEY_RIGHTBRACE => KEY_EQUAL,
-        KEY_A => KEY_A,
-        KEY_S => KEY_O,
-        KEY_D => KEY_E,
-        KEY_F => KEY_U,
-        KEY_G => KEY_I,
-        KEY_H => KEY_D,
-        KEY_J => KEY_H,
-        KEY_K => KEY_T,
-        KEY_L => KEY_N,
-        KEY_SEMICOLON => KEY_S,
+        KEY_S          => KEY_O,
+        KEY_D          => KEY_E,
+        KEY_F          => KEY_U,
+        KEY_G          => KEY_I,
+        KEY_H          => KEY_D,
+        KEY_J          => KEY_H,
+        KEY_K          => KEY_T,
+        KEY_L          => KEY_N,
+        KEY_SEMICOLON  => KEY_S,
         KEY_APOSTROPHE => KEY_MINUS,
-        KEY_Z => KEY_SEMICOLON,
-        KEY_X => KEY_Q,
-        KEY_C => KEY_J,
-        KEY_V => KEY_K,
-        KEY_B => KEY_X,
-        KEY_N => KEY_B,
-        KEY_M => KEY_M,
-        KEY_COMMA => KEY_W,
-        KEY_DOT => KEY_V,
-        KEY_SLASH => KEY_Z,
+        KEY_Z          => KEY_SEMICOLON,
+        KEY_X          => KEY_Q,
+        KEY_C          => KEY_J,
+        KEY_V          => KEY_K,
+        KEY_B          => KEY_X,
+        KEY_N          => KEY_B,
+        KEY_COMMA      => KEY_W,
+        KEY_DOT        => KEY_V,
+        KEY_SLASH      => KEY_Z,
         k => k,
     }
 }
@@ -289,8 +288,6 @@ fn custom_swap(key: u16) -> u16 {
 // ── Space-as-meta state machine ───────────────────────────────────────────────
 // Based on https://gitlab.com/interception/linux/plugins/space2meta
 
-const SM_DELAY_US: u64 = 20_000;
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SmState {
     Start,
@@ -308,24 +305,23 @@ struct Sm {
 
 impl Sm {
     fn new() -> Self {
-        // SAFETY: timeval is a plain C struct; zeroing it is valid.
         Sm {
             state: SmState::Start,
-            key_held_time: unsafe { mem::zeroed() },
+            key_held_time: timeval { tv_sec: 0, tv_usec: 0 },
             key_held_raw: 0,
             key_held_mapped: 0,
         }
     }
 }
 
-fn sm_sleep() {
-    thread::sleep(Duration::from_micros(SM_DELAY_US));
-}
-
 /// The space-as-meta state machine.  Receives both the raw physical keycode
 /// (`raw_code`) and the already-remapped dvorak keycode (`mapped_code`).
 /// Meta-chord paths emit `raw_code` (QWERTY positions); tap/character paths
 /// emit `mapped_code` (Dvorak output).
+///
+/// Instead of sleeping between synthetic events (which would block the read
+/// loop), we offset timestamps by 1 ms per step.  The compositor sees correct
+/// ordering without any real delay.
 fn sm_emit(
     sm: &mut Sm,
     out_fd: RawFd,
@@ -349,16 +345,18 @@ fn sm_emit(
                 if value != 0 {
                     return; // suppress repeat
                 }
-                // space released alone → emit a real space tap
+                // Space released alone → emit a real space tap.
+                // Offset the key-up by 1 ms so compositors see down-then-up
+                // in the correct order without us ever sleeping.
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                sm_sleep();
-                emit(out_fd, EV_KEY, KEY_SPACE, 0, time);
+                emit(out_fd, EV_KEY, KEY_SPACE, 0, tv_add_us(time, 1_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(time, 1_000));
                 sm.state = SmState::Start;
                 return;
             }
             if ev_type == EV_KEY && value == 1 {
-                // another key pressed — buffer it; resolve on next event
+                // Another key pressed — buffer it; resolve on next event.
                 sm.key_held_raw = raw_code;
                 sm.key_held_mapped = mapped_code;
                 sm.key_held_time = time;
@@ -366,62 +364,66 @@ fn sm_emit(
                 return;
             }
             if ev_type == EV_KEY {
-                // release/repeat of a key held before space was pressed
+                // Release/repeat of a key held before space was pressed.
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                sm_sleep();
-                emit(out_fd, ev_type, mapped_code, value, time);
+                emit(out_fd, ev_type, mapped_code, value, tv_add_us(time, 1_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(time, 1_000));
                 sm.state = SmState::Start;
                 return;
             }
             if ev_type == EV_REL || ev_type == EV_ABS {
-                // mouse/joystick movement while space held → activate meta
+                // Mouse/joystick movement while space held → activate meta.
+                // raw_code here is the axis index, which is correct to pass through.
                 emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                sm_sleep();
-                emit(out_fd, ev_type, raw_code, value, time);
+                emit(out_fd, ev_type, raw_code, value, tv_add_us(time, 1_000));
                 sm.state = SmState::SpaceIsMeta;
                 return;
             }
-            // EV_SYN or other — pass through without changing state
-            emit(out_fd, ev_type, mapped_code, value, time);
+            // EV_SYN or other — pass through using raw_code (not mapped_code).
+            emit(out_fd, ev_type, raw_code, value, time);
         }
 
         SmState::KeyHeld => {
-            // suppress repeats of space or the buffered key while deciding
+            // Suppress repeats of space or the buffered key while still deciding.
             if ev_type == EV_KEY
                 && (raw_code == KEY_SPACE || raw_code == sm.key_held_raw)
                 && value != 0
             {
                 return;
             }
-            if ev_type == EV_KEY && raw_code == KEY_SPACE {
-                // space released — was just a prefix, not meta; emit tap
+            if ev_type == EV_KEY && raw_code == KEY_SPACE && value == 0 {
+                // Space released — it was just a prefix, not meta.
+                // Emit: space-down @kht, key-down @kht+1ms, key-up @kht+2ms,
+                // then space-up at actual current time.
+                // The explicit key-up ensures the buffered key is always
+                // cleanly released even if its physical release arrives late.
                 let kht = sm.key_held_time;
                 let khm = sm.key_held_mapped;
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, kht);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
+                emit(out_fd, EV_KEY, khm, 1, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_KEY, khm, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_KEY, KEY_SPACE, 0, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                sm_sleep();
-                emit(out_fd, EV_KEY, khm, 1, kht);
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                sm_sleep();
-                emit(out_fd, ev_type, mapped_code, value, time);
                 sm.state = SmState::Start;
             } else if ev_type == EV_KEY || ev_type == EV_REL || ev_type == EV_ABS {
-                // another event — commit: space becomes meta, use raw keycodes
+                // Another event arrived — commit: space becomes meta.
+                // Use raw keycodes (QWERTY positions) for the chord.
                 let kht = sm.key_held_time;
                 let khr = sm.key_held_raw;
                 emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, kht);
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                sm_sleep();
-                emit(out_fd, EV_KEY, khr, 1, kht);
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                sm_sleep();
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
+                emit(out_fd, EV_KEY, khr, 1, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
                 emit(out_fd, ev_type, raw_code, value, time);
                 sm.state = SmState::SpaceIsMeta;
             } else {
-                // EV_SYN or other — pass through without changing state
-                emit(out_fd, ev_type, mapped_code, value, time);
+                // EV_SYN or other — pass through using raw_code, not mapped_code.
+                emit(out_fd, ev_type, raw_code, value, time);
             }
         }
 
@@ -433,7 +435,8 @@ fn sm_emit(
                 emit(out_fd, EV_KEY, KEY_LEFTMETA, value, time);
                 return;
             }
-            // In meta mode all keys use raw (QWERTY) positions
+            // In meta mode all keys use raw (QWERTY) positions.
+            // For EV_REL/EV_ABS, raw_code is the axis index — correct to pass through.
             emit(out_fd, ev_type, raw_code, value, time);
         }
     }
@@ -441,8 +444,9 @@ fn sm_emit(
 
 // ── Capability helpers ────────────────────────────────────────────────────────
 
-fn has_event_type(array_bit_ev: &[u32], event_type: u16) -> bool {
-    (array_bit_ev[(event_type / 32) as usize] & (1u32 << (event_type % 32))) != 0
+/// Returns true if bit `index` is set in the u32 bitmap slice.
+fn test_bit(bitmap: &[u32], index: u16) -> bool {
+    (bitmap[(index / 32) as usize] & (1u32 << (index % 32))) != 0
 }
 
 /// Iterates every bit set in `array_bit` (indices 0..<max_val) and calls the
@@ -456,7 +460,7 @@ fn setup_event_type(
     array_bit: &[u32],
 ) -> bool {
     for i in 0..max_val {
-        if (array_bit[(i / 32) as usize] & (1u32 << (i % 32))) == 0 {
+        if !test_bit(array_bit, i) {
             continue;
         }
         // SAFETY: ioctl is inherently unsafe; all arguments are valid.
@@ -490,7 +494,7 @@ fn setup_event_type(
                             i,
                             std::io::Error::last_os_error()
                         );
-                        continue;
+                        return false;
                     }
                     if libc::ioctl(out_fd, UI_ABS_SETUP, &abs_setup as *const UinputAbsSetup) < 0 {
                         eprintln!(
@@ -498,7 +502,7 @@ fn setup_event_type(
                             i,
                             std::io::Error::last_os_error()
                         );
-                        continue;
+                        return false;
                     }
                     libc::ioctl(out_fd, UI_SET_ABSBIT, i as c_int)
                 }
@@ -520,7 +524,7 @@ fn setup_event_type(
 
 // ── Remapped-key tracking ─────────────────────────────────────────────────────
 
-const MAX_LENGTH: usize = 8;
+const MAX_REMAPPED: usize = 8;
 
 #[derive(Copy, Clone)]
 struct KeyPair {
@@ -528,29 +532,76 @@ struct KeyPair {
     emitted: u16,
 }
 
-fn remapped_find(keys: &[KeyPair], original: u16) -> Option<u16> {
-    keys.iter()
-        .find(|k| k.original == original)
-        .map(|k| k.emitted)
+/// A small fixed-capacity list tracking which physical keys have been remapped
+/// so that releases and repeats can emit the same keycode as the original press.
+struct RemappedKeys(Vec<KeyPair>);
+
+impl RemappedKeys {
+    fn new() -> Self {
+        RemappedKeys(Vec::with_capacity(MAX_REMAPPED))
+    }
+
+    fn find(&self, original: u16) -> Option<u16> {
+        self.0.iter().find(|k| k.original == original).map(|k| k.emitted)
+    }
+
+    fn remove(&mut self, original: u16) -> Option<u16> {
+        if let Some(pos) = self.0.iter().position(|k| k.original == original) {
+            let emitted = self.0[pos].emitted;
+            self.0.remove(pos);
+            Some(emitted)
+        } else {
+            None
+        }
+    }
+
+    /// Attempt to record a new mapping. Logs a warning and returns false if
+    /// the list is full.
+    fn push(&mut self, original: u16, emitted: u16) -> bool {
+        if self.0.len() >= MAX_REMAPPED {
+            eprintln!(
+                "Warning: too many simultaneous remapped keys ({}), dropping 0x{:04x}.",
+                MAX_REMAPPED, original
+            );
+            return false;
+        }
+        self.0.push(KeyPair { original, emitted });
+        true
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+
 }
 
-fn remapped_remove(keys: &mut Vec<KeyPair>, original: u16) -> Option<u16> {
-    if let Some(pos) = keys.iter().position(|k| k.original == original) {
-        let emitted = keys[pos].emitted;
-        keys.remove(pos);
-        Some(emitted)
-    } else {
-        None
+impl<'a> IntoIterator for &'a RemappedKeys {
+    type Item = &'a KeyPair;
+    type IntoIter = std::slice::Iter<'a, KeyPair>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }
 
-// ── Time helper ───────────────────────────────────────────────────────────────
 
 fn current_time() -> timeval {
-    // SAFETY: gettimeofday with a null timezone pointer is well-defined.
-    let mut tv: timeval = unsafe { mem::zeroed() };
-    unsafe { libc::gettimeofday(&mut tv, ptr::null_mut()) };
-    tv
+    let d = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    timeval {
+        tv_sec:  d.as_secs() as libc::time_t,
+        tv_usec: d.subsec_micros() as libc::suseconds_t,
+    }
+}
+
+/// Add `micros` microseconds to a timeval, carrying into tv_sec as needed.
+fn tv_add_us(tv: timeval, micros: i64) -> timeval {
+    let us = tv.tv_usec as i64 + micros;
+    timeval {
+        tv_sec:  tv.tv_sec + (us.div_euclid(1_000_000)) as libc::time_t,
+        tv_usec: us.rem_euclid(1_000_000) as libc::suseconds_t,
+    }
 }
 
 // ── Usage ─────────────────────────────────────────────────────────────────────
@@ -593,30 +644,19 @@ fn main() {
     let mut match_str: Option<String> = None;
     let mut args_ok = true;
 
-    let mut idx = 1usize;
-    while idx < args.len() {
-        match args[idx].as_str() {
-            "-d" => {
-                idx += 1;
-                if idx < args.len() {
-                    device = Some(args[idx].clone());
-                } else {
-                    args_ok = false;
-                }
-            }
-            "-m" => {
-                idx += 1;
-                if idx < args.len() {
-                    match_str = Some(args[idx].clone());
-                } else {
-                    args_ok = false;
-                }
-            }
-            _ => {
-                args_ok = false;
-            }
+    let mut iter = args[1..].iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "-d" => match iter.next() {
+                Some(val) => device = Some(val.clone()),
+                None => { args_ok = false; break; }
+            },
+            "-m" => match iter.next() {
+                Some(val) => match_str = Some(val.clone()),
+                None => { args_ok = false; break; }
+            },
+            _ => { args_ok = false; break; }
         }
-        idx += 1;
     }
 
     let device = match (args_ok, device) {
@@ -632,20 +672,17 @@ fn main() {
     };
 
     // ── Open input device ─────────────────────────────────────────────────────
-    let dev_cstr = std::ffi::CString::new(device.as_bytes()).expect("device path has interior NUL");
-    // SAFETY: open() is always unsafe; path and flags are valid.
-    let fdi: RawFd = unsafe { libc::open(dev_cstr.as_ptr(), O_RDONLY) };
-    if fdi < 0 {
-        eprintln!(
-            "Error: Failed to open device [{}]: {}.",
-            device,
-            std::io::Error::last_os_error()
-        );
-        eprintln!(
-            "Hint: Check if the device path is correct and you have the necessary permissions."
-        );
-        std::process::exit(1);
-    }
+    let fdi_file = match File::open(&device) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: Failed to open device [{}]: {}.", device, e);
+            eprintln!(
+                "Hint: Check if the device path is correct and you have the necessary permissions."
+            );
+            std::process::exit(1);
+        }
+    };
+    let fdi: RawFd = fdi_file.as_raw_fd();
 
     // ── Read device name ──────────────────────────────────────────────────────
     let mut kname_buf = [0u8; UINPUT_MAX_NAME_SIZE];
@@ -664,7 +701,6 @@ fn main() {
             std::io::Error::last_os_error()
         );
         eprintln!("Hint: Verify if the device is functional and properly configured.");
-        unsafe { libc::close(fdi) };
         std::process::exit(1);
     }
     let nul_pos = kname_buf
@@ -680,7 +716,6 @@ fn main() {
             "Info: Skipping mapping for the device we just created: {}.",
             keyboard_name
         );
-        unsafe { libc::close(fdi) };
         return;
     }
 
@@ -703,7 +738,6 @@ fn main() {
                 "Error: Device [{}] does not match any of the specified keywords: [{}].",
                 keyboard_name, ms
             );
-            unsafe { libc::close(fdi) };
             std::process::exit(1);
         }
     }
@@ -725,7 +759,6 @@ fn main() {
         ($req:expr, $buf:expr, $errmsg:literal) => {
             if unsafe { libc::ioctl(fdi, $req, $buf.as_mut_ptr()) } < 0 {
                 eprintln!($errmsg, device, std::io::Error::last_os_error());
-                unsafe { libc::close(fdi) };
                 std::process::exit(1);
             }
         };
@@ -737,28 +770,28 @@ fn main() {
         "Error: Failed to retrieve event capabilities for device [{}]: {}."
     );
 
-    if has_event_type(&bit_ev, EV_KEY) {
+    if test_bit(&bit_ev, EV_KEY) {
         ioctl_getbit!(
             eviocgbit(EV_KEY as u32, key_words * 4),
             bit_key,
             "Error: Failed to retrieve EV_KEY capabilities for device [{}]: {}."
         );
     }
-    if has_event_type(&bit_ev, EV_REL) {
+    if test_bit(&bit_ev, EV_REL) {
         ioctl_getbit!(
             eviocgbit(EV_REL as u32, rel_words * 4),
             bit_rel,
             "Error: Failed to retrieve EV_REL capabilities for device [{}]: {}."
         );
     }
-    if has_event_type(&bit_ev, EV_ABS) {
+    if test_bit(&bit_ev, EV_ABS) {
         ioctl_getbit!(
             eviocgbit(EV_ABS as u32, abs_words * 4),
             bit_abs,
             "Error: Failed to retrieve EV_ABS capabilities for device [{}]: {}."
         );
     }
-    if has_event_type(&bit_ev, EV_MSC) {
+    if test_bit(&bit_ev, EV_MSC) {
         ioctl_getbit!(
             eviocgbit(EV_MSC as u32, msc_words * 4),
             bit_msc,
@@ -767,13 +800,11 @@ fn main() {
     }
 
     // ── Verify this is a keyboard ─────────────────────────────────────────────
-    let has_key = |k: u16| (bit_key[(k / 32) as usize] & (1u32 << (k % 32))) != 0;
-    if !has_key(KEY_X) || !has_key(KEY_C) || !has_key(KEY_V) {
+    if !test_bit(&bit_key, KEY_X) || !test_bit(&bit_key, KEY_C) || !test_bit(&bit_key, KEY_V) {
         println!(
             "Info: Device [{}] is not recognized as a keyboard (missing essential keys).",
             device
         );
-        unsafe { libc::close(fdi) };
         return;
     }
 
@@ -792,21 +823,23 @@ fn main() {
     usetup.name[..vname.len()].copy_from_slice(vname);
 
     // ── Open /dev/uinput ──────────────────────────────────────────────────────
-    // O_NONBLOCK prevents open() from blocking during device initialisation;
-    // we clear it immediately so writes block rather than silently fail with
+    // O_NONBLOCK prevents open() blocking during device initialisation;
+    // we clear it immediately so writes block rather than silently failing with
     // EAGAIN under load.
-    // SAFETY: open() is always unsafe.
-    let fdo: RawFd =
-        unsafe { libc::open(b"/dev/uinput\0".as_ptr() as *const libc::c_char, O_WRONLY | O_NONBLOCK) };
-    if fdo < 0 {
-        eprintln!(
-            "Error: Failed to open /dev/uinput for device [{}]: {}.",
-            device,
-            std::io::Error::last_os_error()
-        );
-        unsafe { libc::close(fdi) };
-        std::process::exit(1);
-    }
+    let fdo_file = match OpenOptions::new()
+        .write(true)
+        .custom_flags(O_NONBLOCK)
+        .open("/dev/uinput")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: Failed to open /dev/uinput for device [{}]: {}.", device, e);
+            std::process::exit(1);
+        }
+    };
+    let fdo: RawFd = fdo_file.as_raw_fd();
+    // Clear O_NONBLOCK so subsequent writes block instead of returning EAGAIN.
+    // SAFETY: fcntl is inherently unsafe; F_GETFL/F_SETFL are always valid.
     unsafe {
         let flags = libc::fcntl(fdo, F_GETFL);
         libc::fcntl(fdo, F_SETFL, flags & !O_NONBLOCK);
@@ -817,7 +850,6 @@ fn main() {
         ($fd:expr, $req:expr, $arg:expr, $errmsg:literal) => {
             if unsafe { libc::ioctl($fd, $req, $arg) } < 0 {
                 eprintln!($errmsg, device, std::io::Error::last_os_error());
-                unsafe { libc::close(fdo); libc::close(fdi) };
                 std::process::exit(1);
             }
         };
@@ -834,7 +866,6 @@ fn main() {
         ($ioctl:expr, $bits:expr, $max:expr, $msg:literal) => {
             if !setup_event_type(fdi, fdo, $ioctl, $max, &$bits) {
                 eprintln!($msg, device, std::io::Error::last_os_error());
-                unsafe { libc::close(fdo); libc::close(fdi) };
                 std::process::exit(1);
             }
         };
@@ -852,7 +883,6 @@ fn main() {
             "Cannot create device: {}.",
             std::io::Error::last_os_error()
         );
-        unsafe { libc::close(fdo); libc::close(fdi) };
         std::process::exit(1);
     }
 
@@ -864,7 +894,6 @@ fn main() {
             "Cannot grab key: {}.",
             std::io::Error::last_os_error()
         );
-        unsafe { libc::close(fdo); libc::close(fdi) };
         std::process::exit(1);
     }
 
@@ -872,7 +901,7 @@ fn main() {
     let mut sm = Sm::new();
     let mut mod_state: i32 = 0;
     let mut remapping_enabled = true;
-    let mut remapped_keys: Vec<KeyPair> = Vec::with_capacity(MAX_LENGTH);
+    let mut remapped_keys = RemappedKeys::new();
 
     eprintln!(
         "Starting event loop with keyboard: [{}] for device [{}].",
@@ -885,7 +914,12 @@ fn main() {
         }
 
         // SAFETY: read() fills a valid, correctly-sized InputEvent buffer.
-        let mut ev: InputEvent = unsafe { mem::zeroed() };
+        let mut ev = InputEvent {
+            time: timeval { tv_sec: 0, tv_usec: 0 },
+            ev_type: 0,
+            code: 0,
+            value: 0,
+        };
         let n = unsafe {
             libc::read(
                 fdi,
@@ -925,9 +959,6 @@ fn main() {
             // Flush any held remapped keys so nothing gets stuck on toggle.
             let now = current_time();
             for kp in &remapped_keys {
-                if kp.original == 0 {
-                    continue;
-                }
                 emit(fdo, EV_KEY, kp.emitted, 0, now);
                 emit(fdo, EV_SYN, SYN_REPORT, 0, now);
             }
@@ -954,23 +985,35 @@ fn main() {
         }
 
         // Cycle remap (capslock/enter/backspace/escape) is always active.
-        // Must be checked before repeat/release paths for consistent translation.
+        // Route through the same press/repeat/release tracking as other remapped
+        // keys — without this, a held cycled key would send the wrong keycode on
+        // release (e.g. Enter pressed → Backspace emitted, but Enter released →
+        // Enter up sent instead of Backspace up).
         let cycled = custom_cycle(ev.code);
         if cycled != ev.code {
-            sm_emit(&mut sm, fdo, ev.ev_type, cycled, cycled, ev.value, ev.time);
+            if ev.value == 2 {
+                let found = remapped_keys.find(ev.code).unwrap_or(cycled);
+                sm_emit(&mut sm, fdo, ev.ev_type, cycled, found, ev.value, ev.time);
+            } else if ev.value == 0 {
+                let found = remapped_keys.remove(ev.code).unwrap_or(cycled);
+                sm_emit(&mut sm, fdo, ev.ev_type, cycled, found, ev.value, ev.time);
+            } else {
+                remapped_keys.push(ev.code, cycled);
+                sm_emit(&mut sm, fdo, ev.ev_type, cycled, cycled, ev.value, ev.time);
+            }
             continue;
         }
 
         // Repeat — resolve from tracking array (mod state may have changed).
         if ev.value == 2 {
-            let found = remapped_find(&remapped_keys, ev.code).unwrap_or(ev.code);
+            let found = remapped_keys.find(ev.code).unwrap_or(ev.code);
             sm_emit(&mut sm, fdo, ev.ev_type, ev.code, found, ev.value, ev.time);
             continue;
         }
 
         // Release — remove from tracking array.
         if ev.value == 0 {
-            let found = remapped_remove(&mut remapped_keys, ev.code).unwrap_or(ev.code);
+            let found = remapped_keys.remove(ev.code).unwrap_or(ev.code);
             sm_emit(&mut sm, fdo, ev.ev_type, ev.code, found, ev.value, ev.time);
             continue;
         }
@@ -991,16 +1034,7 @@ fn main() {
         }
 
         // Remapped key press: track original→emitted so release can find it.
-        if remapped_keys.len() >= MAX_LENGTH {
-            eprintln!(
-                "Warning: too many simultaneous remapped keys ({}), dropping 0x{:04x}.",
-                MAX_LENGTH, ev.code
-            );
-        } else {
-            remapped_keys.push(KeyPair {
-                original: ev.code,
-                emitted: dvorak_code,
-            });
+        if remapped_keys.push(ev.code, dvorak_code) {
             sm_emit(&mut sm, fdo, ev.ev_type, ev.code, dvorak_code, ev.value, ev.time);
         }
     }
@@ -1010,17 +1044,11 @@ fn main() {
     // is no longer flowing through).
     let now = current_time();
     for kp in &remapped_keys {
-        if kp.original == 0 {
-            continue;
-        }
         emit(fdo, EV_KEY, kp.emitted, 0, now);
         emit(fdo, EV_SYN, SYN_REPORT, 0, now);
     }
 
-    // SAFETY: ioctl/close are always unsafe.
-    unsafe {
-        libc::ioctl(fdi, EVIOCGRAB, 0i32);
-        libc::close(fdi);
-        libc::close(fdo);
-    }
+    // SAFETY: ioctl is inherently unsafe.
+    unsafe { libc::ioctl(fdi, EVIOCGRAB, 0i32) };
+    // fdi_file and fdo_file drop here, closing both file descriptors.
 }
