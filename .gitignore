@@ -5,3 +5,5 @@ dvorak.o
 .vscode
 .vscode/settings.json
 .zed
+Cargo.lock
+target/
