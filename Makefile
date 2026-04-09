@@ -6,6 +6,9 @@ CFLAGS = -Wall -O3 -static
 
 default: all
 
+rust:
+	cargo build --release
+
 all: dvorak.c
 	$(CC) $(CFLAGS) -o $(TARGET) dvorak.c
 
@@ -23,7 +26,7 @@ clean:
 	-rm -f $(TARGET) test_dvorak
 
 install: all
-	cp dvorak /usr/local/bin/dvorak
+	cp target/release/dvorak /usr/local/bin/dvorak
 	cp 80-dvorak.rules /etc/udev/rules.d/
 	cp dvorak@.service /etc/systemd/system/
 	# Create the dvorak system user in the input group if it doesn't exist

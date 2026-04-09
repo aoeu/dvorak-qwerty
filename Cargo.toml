@@ -1,0 +1,11 @@
+[package]
+name = "dvorak"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dvorak"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
