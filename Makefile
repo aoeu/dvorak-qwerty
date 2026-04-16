@@ -25,7 +25,7 @@ test:
 clean:
 	-rm -f $(TARGET) test_dvorak
 
-install: all
+install: all stop
 	cp target/release/dvorak /usr/local/bin/dvorak
 	cp 80-dvorak.rules /etc/udev/rules.d/
 	cp dvorak@.service /etc/systemd/system/

@@ -394,7 +394,7 @@ fn sm_emit(
                 return;
             }
             if ev_type == EV_KEY && raw_code == KEY_SPACE && value == 0 {
-                // Space released — it was just a prefix, not meta.
+                // Space released first — was just a prefix, not meta.
                 // Emit: space-down @kht, key-down @kht+1ms, key-up @kht+2ms,
                 // then space-up at actual current time.
                 // The explicit key-up ensures the buffered key is always
@@ -410,9 +410,54 @@ fn sm_emit(
                 emit(out_fd, EV_KEY, KEY_SPACE, 0, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
                 sm.state = SmState::Start;
-            } else if ev_type == EV_KEY || ev_type == EV_REL || ev_type == EV_ABS {
-                // Another event arrived — commit: space becomes meta.
-                // Use raw keycodes (QWERTY positions) for the chord.
+            } else if ev_type == EV_KEY && raw_code == sm.key_held_raw && value == 0 {
+                // Chord key released while space is still held — deliberate meta chord.
+                // Commit: emit Meta+key down, then Meta+key up.
+                // Space-up will follow naturally when space is released.
+                let kht = sm.key_held_time;
+                let khr = sm.key_held_raw;
+                emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, kht);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
+                emit(out_fd, EV_KEY, khr, 1, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_KEY, khr, 0, time);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+                sm.state = SmState::SpaceIsMeta;
+            } else if ev_type == EV_KEY && value == 1 {
+                // A second key arrived while deciding — this is fast typing, not
+                // a meta chord (nobody intends Space+two_keys as a hotkey).
+                // Flush: emit space as a tap, emit the first buffered key as a
+                // character, then emit the new key as a character too.
+                let kht = sm.key_held_time;
+                let khm = sm.key_held_mapped;
+                emit(out_fd, EV_KEY, KEY_SPACE, 1, kht);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
+                emit(out_fd, EV_KEY, khm, 1, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_KEY, khm, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_KEY, mapped_code, value, time);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+                sm.state = SmState::Start;
+            } else if ev_type == EV_KEY && value == 0
+                && raw_code != sm.key_held_raw
+                && raw_code != KEY_SPACE
+            {
+                // Release of a key that was held *before* space was pressed.
+                // Flush as typing.
+                let kht = sm.key_held_time;
+                let khm = sm.key_held_mapped;
+                emit(out_fd, EV_KEY, KEY_SPACE, 1, kht);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
+                emit(out_fd, EV_KEY, khm, 1, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_KEY, khm, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_KEY, mapped_code, value, time);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+                sm.state = SmState::Start;
+            } else if ev_type == EV_REL || ev_type == EV_ABS {
+                // Mouse/joystick movement — commit as meta chord.
                 let kht = sm.key_held_time;
                 let khr = sm.key_held_raw;
                 emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, kht);
