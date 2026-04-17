@@ -89,6 +89,14 @@ const MSC_MAX: u16 = 0x07;
 const BUS_USB: u16 = 0x03;
 const UINPUT_MAX_NAME_SIZE: usize = 80;
 
+type Microseconds = i64;
+
+/// If a non-space key was pressed within this duration before space,
+/// skip the space2meta buffering and emit space immediately as a real keystroke.
+/// At 30 WPM (~150 CPM) keys arrive ~400 ms apart; 500 ms gives comfortable
+/// headroom while still catching most deliberate hotkey pauses above that.
+const SPACE_META_TRIGGER_THRESHOLD: Microseconds = 500_000;
+
 // ── ioctl request numbers ────────────────────────────────────────────────────
 //
 // Linux _IOC(dir, type, nr, size) = (dir<<30) | (type<<8) | nr | (size<<16)
@@ -258,7 +266,7 @@ fn dvorak_remap(key: u16) -> u16 {
         KEY_COMMA      => KEY_W,
         KEY_DOT        => KEY_V,
         KEY_SLASH      => KEY_Z,
-        k => k,
+        any_other_key => any_other_key,
     }
 }
 
@@ -270,7 +278,7 @@ fn custom_cycle(key: u16) -> u16 {
         KEY_ENTER => KEY_BACKSPACE,
         KEY_BACKSPACE => KEY_ESC,
         KEY_ESC => KEY_CAPSLOCK,
-        k => k,
+        any_other_key => any_other_key,
     }
 }
 
@@ -281,7 +289,7 @@ fn custom_swap(key: u16) -> u16 {
         KEY_Z => KEY_Q,
         KEY_LEFTBRACE => KEY_SLASH,
         KEY_SLASH => KEY_LEFTBRACE,
-        k => k,
+        any_other_key => any_other_key,
     }
 }
 
@@ -294,6 +302,9 @@ enum SmState {
     SpaceHeld,
     KeyHeld,
     SpaceIsMeta,
+    /// Space was already emitted as a real keystroke (fast-typing bypass);
+    /// waiting for the matching key-up before returning to Start.
+    SpaceBypassed,
 }
 
 struct Sm {
@@ -301,6 +312,9 @@ struct Sm {
     key_held_time: timeval,
     key_held_raw: u16,    // physical keycode — used for meta chord emission
     key_held_mapped: u16, // dvorak keycode   — used for tap/character emission
+    /// Timestamp of the most recent non-space key-press; used for the
+    /// fast-typing bypass that skips space2meta buffering.
+    last_key_time: Option<timeval>,
 }
 
 impl Sm {
@@ -310,6 +324,7 @@ impl Sm {
             key_held_time: timeval { tv_sec: 0, tv_usec: 0 },
             key_held_raw: 0,
             key_held_mapped: 0,
+            last_key_time: None,
         }
     }
 }
@@ -331,13 +346,31 @@ fn sm_emit(
     value: i32,
     time: timeval,
 ) {
+    // Track the timestamp of every non-space key press so the fast-typing
+    // bypass in SmState::Start can decide whether space is a word separator.
+    if ev_type == EV_KEY && raw_code != KEY_SPACE && value == 1 {
+        sm.last_key_time = Some(time);
+    }
+
     match sm.state {
         SmState::Start => {
-            if ev_type == EV_KEY && raw_code == KEY_SPACE && value == 1 {
-                sm.state = SmState::SpaceHeld;
-                return; // buffer space; wait to see what follows
+            if ev_type != EV_KEY || raw_code != KEY_SPACE || value != 1 {
+                emit(out_fd, ev_type, mapped_code, value, time);
+                return;
             }
-            emit(out_fd, ev_type, mapped_code, value, time);
+            // Space press: fast-typing bypass — if a non-space key was pressed
+            // recently this space is almost certainly a word separator, not a
+            // meta prefix.  Emit it immediately and enter SpaceBypassed so we
+            // can still forward the key-up without re-entering buffering logic.
+            let is_fast_typing = sm.last_key_time
+                .is_some_and(|lkt| subtract(lkt, time) < SPACE_META_TRIGGER_THRESHOLD);
+            if is_fast_typing {
+                emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+                sm.state = SmState::SpaceBypassed;
+                return;
+            }
+            sm.state = SmState::SpaceHeld; // buffer space; wait to see what follows
         }
 
         SmState::SpaceHeld => {
@@ -350,8 +383,8 @@ fn sm_emit(
                 // in the correct order without us ever sleeping.
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                emit(out_fd, EV_KEY, KEY_SPACE, 0, tv_add_us(time, 1_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(time, 1_000));
+                emit(out_fd, EV_KEY, KEY_SPACE, 0, add(1_000, time));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(1_000, time));
                 sm.state = SmState::Start;
                 return;
             }
@@ -367,8 +400,8 @@ fn sm_emit(
                 // Release/repeat of a key held before space was pressed.
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                emit(out_fd, ev_type, mapped_code, value, tv_add_us(time, 1_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(time, 1_000));
+                emit(out_fd, ev_type, mapped_code, value, add(1_000, time));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(1_000, time));
                 sm.state = SmState::Start;
                 return;
             }
@@ -377,7 +410,7 @@ fn sm_emit(
                 // raw_code here is the axis index, which is correct to pass through.
                 emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                emit(out_fd, ev_type, raw_code, value, tv_add_us(time, 1_000));
+                emit(out_fd, ev_type, raw_code, value, add(1_000, time));
                 sm.state = SmState::SpaceIsMeta;
                 return;
             }
@@ -403,10 +436,10 @@ fn sm_emit(
                 let khm = sm.key_held_mapped;
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, kht);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
-                emit(out_fd, EV_KEY, khm, 1, tv_add_us(kht, 1_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
-                emit(out_fd, EV_KEY, khm, 0, tv_add_us(kht, 2_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_KEY, khm, 1, add(1_000, kht));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(1_000, kht));
+                emit(out_fd, EV_KEY, khm, 0, add(2_000, kht));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(2_000, kht));
                 emit(out_fd, EV_KEY, KEY_SPACE, 0, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
                 sm.state = SmState::Start;
@@ -418,8 +451,8 @@ fn sm_emit(
                 let khr = sm.key_held_raw;
                 emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, kht);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
-                emit(out_fd, EV_KEY, khr, 1, tv_add_us(kht, 1_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_KEY, khr, 1, add(1_000, kht));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(1_000, kht));
                 emit(out_fd, EV_KEY, khr, 0, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
                 sm.state = SmState::SpaceIsMeta;
@@ -432,10 +465,10 @@ fn sm_emit(
                 let khm = sm.key_held_mapped;
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, kht);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
-                emit(out_fd, EV_KEY, khm, 1, tv_add_us(kht, 1_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
-                emit(out_fd, EV_KEY, khm, 0, tv_add_us(kht, 2_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_KEY, khm, 1, add(1_000, kht));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(1_000, kht));
+                emit(out_fd, EV_KEY, khm, 0, add(2_000, kht));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(2_000, kht));
                 emit(out_fd, EV_KEY, mapped_code, value, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
                 sm.state = SmState::Start;
@@ -449,10 +482,10 @@ fn sm_emit(
                 let khm = sm.key_held_mapped;
                 emit(out_fd, EV_KEY, KEY_SPACE, 1, kht);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
-                emit(out_fd, EV_KEY, khm, 1, tv_add_us(kht, 1_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
-                emit(out_fd, EV_KEY, khm, 0, tv_add_us(kht, 2_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 2_000));
+                emit(out_fd, EV_KEY, khm, 1, add(1_000, kht));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(1_000, kht));
+                emit(out_fd, EV_KEY, khm, 0, add(2_000, kht));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(2_000, kht));
                 emit(out_fd, EV_KEY, mapped_code, value, time);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
                 sm.state = SmState::Start;
@@ -462,8 +495,8 @@ fn sm_emit(
                 let khr = sm.key_held_raw;
                 emit(out_fd, EV_KEY, KEY_LEFTMETA, 1, kht);
                 emit(out_fd, EV_SYN, SYN_REPORT, 0, kht);
-                emit(out_fd, EV_KEY, khr, 1, tv_add_us(kht, 1_000));
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, tv_add_us(kht, 1_000));
+                emit(out_fd, EV_KEY, khr, 1, add(1_000, kht));
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, add(1_000, kht));
                 emit(out_fd, ev_type, raw_code, value, time);
                 sm.state = SmState::SpaceIsMeta;
             } else {
@@ -483,6 +516,21 @@ fn sm_emit(
             // In meta mode all keys use raw (QWERTY) positions.
             // For EV_REL/EV_ABS, raw_code is the axis index — correct to pass through.
             emit(out_fd, ev_type, raw_code, value, time);
+        }
+
+        SmState::SpaceBypassed => {
+            if ev_type == EV_KEY && raw_code == KEY_SPACE {
+                // Forward the key-up (and any repeat) for the space we already
+                // emitted on the down stroke, then return to Start on release.
+                emit(out_fd, EV_KEY, KEY_SPACE, value, time);
+                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
+                if value == 0 {
+                    sm.state = SmState::Start;
+                }
+                return;
+            }
+            // All other events (other keys, mouse, syn…) pass straight through.
+            emit(out_fd, ev_type, mapped_code, value, time);
         }
     }
 }
@@ -630,7 +678,7 @@ impl<'a> IntoIterator for &'a RemappedKeys {
 }
 
 
-fn current_time() -> timeval {
+fn get_current_time() -> timeval {
     let d = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
@@ -640,13 +688,19 @@ fn current_time() -> timeval {
     }
 }
 
-/// Add `micros` microseconds to a timeval, carrying into tv_sec as needed.
-fn tv_add_us(tv: timeval, micros: i64) -> timeval {
-    let us = tv.tv_usec as i64 + micros;
+/// Add `amount` microseconds to a timeval, carrying into tv_sec as needed.
+fn add(amount: Microseconds, to: timeval) -> timeval {
+    let total = to.tv_usec as Microseconds + amount;
     timeval {
-        tv_sec:  tv.tv_sec + (us.div_euclid(1_000_000)) as libc::time_t,
-        tv_usec: us.rem_euclid(1_000_000) as libc::suseconds_t,
+        tv_sec:  to.tv_sec + (total.div_euclid(1_000_000)) as libc::time_t,
+        tv_usec: total.rem_euclid(1_000_000) as libc::suseconds_t,
     }
+}
+
+/// Returns how many microseconds `value` is ahead of `from`.
+fn subtract(value: timeval, from: timeval) -> Microseconds {
+    (value.tv_sec - from.tv_sec) as Microseconds * 1_000_000
+        + (value.tv_usec - from.tv_usec) as Microseconds
 }
 
 // ── Usage ─────────────────────────────────────────────────────────────────────
@@ -985,12 +1039,12 @@ fn main() {
 
         // EV_REL and EV_ABS (mouse/joystick) go through the space2meta filter.
         // EV_SYN and all other non-key events pass straight through.
+        if ev.ev_type == EV_REL || ev.ev_type == EV_ABS {
+            sm_emit(&mut sm, fdo, ev.ev_type, ev.code, ev.code, ev.value, ev.time);
+            continue;
+        }
         if ev.ev_type != EV_KEY {
-            if ev.ev_type == EV_REL || ev.ev_type == EV_ABS {
-                sm_emit(&mut sm, fdo, ev.ev_type, ev.code, ev.code, ev.value, ev.time);
-            } else {
-                emit(fdo, ev.ev_type, ev.code, ev.value, ev.time);
-            }
+            emit(fdo, ev.ev_type, ev.code, ev.value, ev.time);
             continue;
         }
 
@@ -1002,7 +1056,7 @@ fn main() {
                 if remapping_enabled { "enabled" } else { "disabled" }
             );
             // Flush any held remapped keys so nothing gets stuck on toggle.
-            let now = current_time();
+            let now = get_current_time();
             for kp in &remapped_keys {
                 emit(fdo, EV_KEY, kp.emitted, 0, now);
                 emit(fdo, EV_SYN, SYN_REPORT, 0, now);
@@ -1036,16 +1090,12 @@ fn main() {
         // Enter up sent instead of Backspace up).
         let cycled = custom_cycle(ev.code);
         if cycled != ev.code {
-            if ev.value == 2 {
-                let found = remapped_keys.find(ev.code).unwrap_or(cycled);
-                sm_emit(&mut sm, fdo, ev.ev_type, cycled, found, ev.value, ev.time);
-            } else if ev.value == 0 {
-                let found = remapped_keys.remove(ev.code).unwrap_or(cycled);
-                sm_emit(&mut sm, fdo, ev.ev_type, cycled, found, ev.value, ev.time);
-            } else {
-                remapped_keys.push(ev.code, cycled);
-                sm_emit(&mut sm, fdo, ev.ev_type, cycled, cycled, ev.value, ev.time);
-            }
+            let mapped = match ev.value {
+                2 => remapped_keys.find(ev.code).unwrap_or(cycled),
+                0 => remapped_keys.remove(ev.code).unwrap_or(cycled),
+                _ => { remapped_keys.push(ev.code, cycled); cycled }
+            };
+            sm_emit(&mut sm, fdo, ev.ev_type, cycled, mapped, ev.value, ev.time);
             continue;
         }
 
@@ -1087,7 +1137,7 @@ fn main() {
     // ── Cleanup: release any keys still held when the loop exited ─────────────
     // Each key-up needs a manual EV_SYN (the physical device's EV_SYN stream
     // is no longer flowing through).
-    let now = current_time();
+    let now = get_current_time();
     for kp in &remapped_keys {
         emit(fdo, EV_KEY, kp.emitted, 0, now);
         emit(fdo, EV_SYN, SYN_REPORT, 0, now);
