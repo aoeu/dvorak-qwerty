@@ -91,12 +91,6 @@ const UINPUT_MAX_NAME_SIZE: usize = 80;
 
 type Microseconds = i64;
 
-/// If a non-space key was pressed within this duration before space,
-/// skip the space2meta buffering and emit space immediately as a real keystroke.
-/// At 30 WPM (~150 CPM) keys arrive ~400 ms apart; 500 ms gives comfortable
-/// headroom while still catching most deliberate hotkey pauses above that.
-const SPACE_META_TRIGGER_THRESHOLD: Microseconds = 500_000;
-
 // ── ioctl request numbers ────────────────────────────────────────────────────
 //
 // Linux _IOC(dir, type, nr, size) = (dir<<30) | (type<<8) | nr | (size<<16)
@@ -302,9 +296,6 @@ enum SmState {
     SpaceHeld,
     KeyHeld,
     SpaceIsMeta,
-    /// Space was already emitted as a real keystroke (fast-typing bypass);
-    /// waiting for the matching key-up before returning to Start.
-    SpaceBypassed,
 }
 
 struct Sm {
@@ -312,9 +303,6 @@ struct Sm {
     key_held_time: timeval,
     key_held_raw: u16,    // physical keycode — used for meta chord emission
     key_held_mapped: u16, // dvorak keycode   — used for tap/character emission
-    /// Timestamp of the most recent non-space key-press; used for the
-    /// fast-typing bypass that skips space2meta buffering.
-    last_key_time: Option<timeval>,
 }
 
 impl Sm {
@@ -324,7 +312,6 @@ impl Sm {
             key_held_time: timeval { tv_sec: 0, tv_usec: 0 },
             key_held_raw: 0,
             key_held_mapped: 0,
-            last_key_time: None,
         }
     }
 }
@@ -346,28 +333,10 @@ fn sm_emit(
     value: i32,
     time: timeval,
 ) {
-    // Track the timestamp of every non-space key press so the fast-typing
-    // bypass in SmState::Start can decide whether space is a word separator.
-    if ev_type == EV_KEY && raw_code != KEY_SPACE && value == 1 {
-        sm.last_key_time = Some(time);
-    }
-
     match sm.state {
         SmState::Start => {
             if ev_type != EV_KEY || raw_code != KEY_SPACE || value != 1 {
                 emit(out_fd, ev_type, mapped_code, value, time);
-                return;
-            }
-            // Space press: fast-typing bypass — if a non-space key was pressed
-            // recently this space is almost certainly a word separator, not a
-            // meta prefix.  Emit it immediately and enter SpaceBypassed so we
-            // can still forward the key-up without re-entering buffering logic.
-            let is_fast_typing = sm.last_key_time
-                .is_some_and(|lkt| subtract(lkt, time) < SPACE_META_TRIGGER_THRESHOLD);
-            if is_fast_typing {
-                emit(out_fd, EV_KEY, KEY_SPACE, 1, time);
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                sm.state = SmState::SpaceBypassed;
                 return;
             }
             sm.state = SmState::SpaceHeld; // buffer space; wait to see what follows
@@ -518,20 +487,6 @@ fn sm_emit(
             emit(out_fd, ev_type, raw_code, value, time);
         }
 
-        SmState::SpaceBypassed => {
-            if ev_type == EV_KEY && raw_code == KEY_SPACE {
-                // Forward the key-up (and any repeat) for the space we already
-                // emitted on the down stroke, then return to Start on release.
-                emit(out_fd, EV_KEY, KEY_SPACE, value, time);
-                emit(out_fd, EV_SYN, SYN_REPORT, 0, time);
-                if value == 0 {
-                    sm.state = SmState::Start;
-                }
-                return;
-            }
-            // All other events (other keys, mouse, syn…) pass straight through.
-            emit(out_fd, ev_type, mapped_code, value, time);
-        }
     }
 }
 
@@ -695,12 +650,6 @@ fn add(amount: Microseconds, to: timeval) -> timeval {
         tv_sec:  to.tv_sec + (total.div_euclid(1_000_000)) as libc::time_t,
         tv_usec: total.rem_euclid(1_000_000) as libc::suseconds_t,
     }
-}
-
-/// Returns how many microseconds `value` is ahead of `from`.
-fn subtract(value: timeval, from: timeval) -> Microseconds {
-    (value.tv_sec - from.tv_sec) as Microseconds * 1_000_000
-        + (value.tv_usec - from.tv_usec) as Microseconds
 }
 
 // ── Usage ─────────────────────────────────────────────────────────────────────
