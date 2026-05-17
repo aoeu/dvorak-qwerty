@@ -1,6 +1,1 @@
-# Grant the input group write access to uinput so the service doesn't need root.
-KERNEL=="uinput", GROUP="input", MODE="0660"
-
-# Start a remapper instance for each keyboard that is plugged in.
-# BindsTo in the service file handles stopping it when the device disappears.
-SUBSYSTEM=="input", KERNEL=="event[0-9]*", ENV{ID_INPUT_KEYBOARD}=="1", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="dvorak@%k.service"
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", ENV{ID_INPUT_KEYBOARD}=="1", ACTION=="add", RUN+="/bin/systemctl start dvorak@%k.service"
